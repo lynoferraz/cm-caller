@@ -691,8 +691,8 @@ func main() {
 		"Flashdrive mememory definition to identify the cartesi machine drive")
 	flag.StringVar(&flashdrivePath, "flash-data", "",
 		"Path to the flashdrive to save and insert in the cartesi machine when present")
-	flag.BoolVar(&disableAdvance, "no-advance", false, "Disable advance requests")
-	flag.BoolVar(&disableInspect, "no-inspect", false, "Disable inspect requests")
+	flag.BoolVar(&disableAdvance, "disable-advance", false, "Disable advance requests")
+	flag.BoolVar(&disableInspect, "disable-inspect", false, "Disable inspect requests")
 	flag.BoolVar(&resetLatestLink, "reset-latest", false,
 		"Reset latest link (otherwise use latest link target as base image)")
 	flag.BoolVar(&help, "help", false, "Show this help")

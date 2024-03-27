@@ -25,11 +25,11 @@ Display help
 Start nonono and cm-caller with custom store path and no inspects
 
 ```shell
-nonodo -- ./cm-caller -store-path=data -flash-data=data/data.ext2 -no-inspect
+nonodo -- ./cm-caller --store-path=data --flash-data=data/data.ext2 --disable-inspect
 ```
 
 Start nonono and cm-caller without advances (inspect-only node)
 
 ```shell
-nonodo --disable-advance --disable-devnet -- ./cm-caller -no-advance
+nonodo --disable-advance --disable-devnet -- ./cm-caller --disable-advance
 ```
