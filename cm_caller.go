@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,12 +27,26 @@ import (
 	"github.com/prototyp3-dev/go-rollups/rollups"
 )
 
+type FlashDriveConfig struct {
+	ImageFilename string `json:"image_filename"`
+	Length        uint   `json:"length"`
+	Shared        bool   `json:"shared"`
+	Start         uint   `json:"start"`
+}
+
+type MachineConfig struct {
+	FlashDriveConfig []FlashDriveConfig `json:"flash_drive"`
+}
+
+type CartesiMachineConfig struct {
+	Config MachineConfig `json:"config"`
+}
+
 var infolog = log.New(os.Stderr, "[ info ]  ", log.Lshortfile)
 var warnlog = log.New(os.Stderr, "[ warn ]  ", log.Lshortfile)
 
 var dirMode fs.FileMode = 0755
 var fileMode fs.FileMode = 0644
-var memSplittedFormatSize int = 2
 var waitDelay time.Duration = 10
 
 var cmCommand string = "cartesi-machine"
@@ -50,12 +66,14 @@ var metadataTyp = abi.MustNewType("tuple(address,uint256,uint256,uint256,uint256
 var bytesTyp = abi.MustNewType("tuple(bytes)")
 var voucherTyp = abi.MustNewType("tuple(address,bytes)")
 
-var imagePath, flashdriveMemDef, flashdrivePath, storePath string
+var imagePath, flashdrivePath, storePath string
 
 var remoteCmCmd *exec.Cmd
 var ctx context.Context
 var cancel context.CancelFunc
 var errorWaitGroup *errgroup.Group
+
+var dataFlashdriveConfig FlashDriveConfig
 
 func SetupImagePaths(resetLatestLink bool) error {
 
@@ -74,7 +92,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 	// starting image path
 	startingImagePath := fmt.Sprintf("%s/%s_start", storePath, baseImagePath)
 
-	// set latest link flash drive
+	// set latest link image
 	_, errLink := os.Lstat(latestLinkPath)
 	if errLink != nil {
 		fmt.Println("error", errLink)
@@ -185,13 +203,39 @@ func SetupImagePaths(resetLatestLink bool) error {
 		return fmt.Errorf("image error: %s", err)
 	}
 
-	// check flash drive
-	if _, err := os.Stat(
-		filepath.Join(
-			latestLinkPath, fmt.Sprintf("%s.bin", flashdriveMemDef))); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("drive error: %s", err)
+	if flashdrivePath != "" {
+		// open config file
+		configFile, err := os.Open(filepath.Join(latestLinkPath, "config.json"))
+		if err != nil {
+			return fmt.Errorf("read config error: %s", err)
 		}
+		defer configFile.Close()
+
+		configByteValue, err := io.ReadAll(configFile)
+		if err != nil {
+			return fmt.Errorf("general config byte conversion error: %s", err)
+		}
+
+		var machineConfig CartesiMachineConfig
+		err = json.Unmarshal(configByteValue, &machineConfig)
+		if err != nil {
+			return fmt.Errorf("flash drives config unmarshall error: %s", err)
+		}
+
+		flasdriveConfigs := machineConfig.Config.FlashDriveConfig
+		dataFlashdriveConfig = flasdriveConfigs[len(flasdriveConfigs)-1]
+
+		flashdriveFile := fmt.Sprintf("%016s-%s.bin",
+			strconv.FormatInt(int64(dataFlashdriveConfig.Start), 16),
+			strconv.FormatInt(int64(dataFlashdriveConfig.Length), 16))
+		if _, err := os.Stat(
+			filepath.Join(
+				latestLinkPath, flashdriveFile)); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("drive error: %s", err)
+			}
+		}
+
 	}
 
 	return nil
@@ -258,27 +302,16 @@ func PreloadCM() error {
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-destroy")
 	// args = append(args, "--max-mcycle=0")
-	args = append(args, "--rollup")
 	args = append(args, "--assert-rolling-template")
 
 	if flashdrivePath != "" {
 		if _, err := os.Stat(flashdrivePath); err == nil {
-			// TODO; Get the start address and size
-			fileInfo, err := os.Stat(fmt.Sprintf("%s/%s.bin",
-				latestLinkPath, flashdriveMemDef))
-			if err != nil {
-				return fmt.Errorf("error getting drive infos: %s", err)
-			}
-
-			splittedMem := strings.Split(flashdriveMemDef, "-")
-			if len(splittedMem) != memSplittedFormatSize {
-				return fmt.Errorf("wrong flasdrive mem format")
-			}
-
 			args = append(args,
 				fmt.Sprintf(
-					"--replace-flash-drive=start:0x%s,length:%d,filename:%s",
-					splittedMem[0], fileInfo.Size(), flashdrivePath))
+					"--replace-flash-drive=start:%d,length:%d,filename:%s",
+					dataFlashdriveConfig.Start,
+					dataFlashdriveConfig.Length,
+					flashdrivePath))
 		}
 	}
 
@@ -388,7 +421,6 @@ func HandleInspect(payloadHex string) error {
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-create")
 	args = append(args, "--no-remote-destroy")
-	args = append(args, "--rollup")
 	args = append(args, "--assert-rolling-template")
 	args = append(args, "--rollup-inspect-state")
 	// args = append(args, "--quiet")
@@ -425,7 +457,7 @@ func HandleInspect(payloadHex string) error {
 }
 
 func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
-	infolog.Println("advance: received with metadata: ", metadata)
+	infolog.Println("advance: received")
 	payloadMap := make(map[string]interface{})
 	data, err := rollups.Hex2Bin(payloadHex)
 	if err != nil {
@@ -479,7 +511,6 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-create")
 	// args = append(args, "--no-remote-destroy")
-	args = append(args, "--rollup")
 	args = append(args, "--assert-rolling-template")
 	args = append(args, fmt.Sprintf(
 		"--rollup-advance-state=epoch_index:%d,input_index_begin:%d,input_index_end:%d",
@@ -595,8 +626,13 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 
 	// copying flash drive
 	if flashdrivePath != "" {
-		source, err := os.Open(filepath.Join(
-			newImagePath, fmt.Sprintf("%s.bin", flashdriveMemDef)))
+
+		flashdriveFile := fmt.Sprintf("%016s-%s.bin",
+			strconv.FormatInt(int64(dataFlashdriveConfig.Start), 16),
+			strconv.FormatInt(int64(dataFlashdriveConfig.Length), 16))
+		fmt.Println("flashdrive file", filepath.Join(
+			newImagePath, flashdriveFile))
+		source, err := os.Open(filepath.Join(newImagePath, flashdriveFile))
 		if err != nil {
 			return err
 		}
@@ -687,8 +723,6 @@ func main() {
 
 	flag.StringVar(&storePath, "store-path", ".", "Path where data and images are stored")
 	flag.StringVar(&imagePath, "image", "image", "Path to the cartesi machine image")
-	flag.StringVar(&flashdriveMemDef, "flash-mem", "0090000000000000-8000000",
-		"Flashdrive mememory definition to identify the cartesi machine drive")
 	flag.StringVar(&flashdrivePath, "flash-data", "",
 		"Path to the flashdrive to save and insert in the cartesi machine when present")
 	flag.BoolVar(&disableAdvance, "disable-advance", false, "Disable advance requests")
@@ -752,7 +786,7 @@ func main() {
 	// start rollup service
 	infolog.Println("starting rollups")
 	errorWaitGroup.Go(func() error {
-		return handler.RunDebugContext(ctx)
+		return handler.RunContext(ctx)
 	})
 
 	// main services processing

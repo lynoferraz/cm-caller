@@ -33,3 +33,12 @@ Start nonono and cm-caller without advances (inspect-only node)
 ```shell
 nonodo --disable-advance --disable-devnet -- ./cm-caller --disable-advance
 ```
+
+## version Campatibility
+
+The cm-caller version depends on the [cartesi machine emulator](https://github.com/cartesi/machine-emulator) version
+
+| Version  | Emulator Version |
+| -------- | ------- |
+| v0.0.1 | v0.15.x |
+| v0.1.0 | v0.16.x |
