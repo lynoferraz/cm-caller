@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"net"
 
 	"golang.org/x/sync/errgroup"
 
@@ -47,7 +48,8 @@ var warnlog = log.New(os.Stderr, "[ warn ]  ", log.Lshortfile)
 
 var dirMode fs.FileMode = 0755
 var fileMode fs.FileMode = 0644
-var waitDelay time.Duration = 10
+var waitDelay time.Duration = 10*time.Second
+var remoteCmInitTimeout time.Duration = 20*time.Second
 
 var cmCommand string = "cartesi-machine"
 var remoteCmCommand string = "jsonrpc-remote-cartesi-machine"
@@ -56,6 +58,7 @@ var remoteCMAddress string = "localhost:8090"
 var cmOutput string = "cartesi_machine.out"
 var latestLinkPath string = "latest"
 var baseImagePath string = "local_image"
+var latestBlockPath string = "latest_block"
 
 var inputFile string = "epoch-%d-input-%d.bin"
 var inputMetadataFile string = "epoch-%d-input-metadata-%d.bin"
@@ -67,6 +70,7 @@ var bytesTyp = abi.MustNewType("tuple(bytes)")
 var voucherTyp = abi.MustNewType("tuple(address,bytes)")
 
 var imagePath, flashdrivePath, storePath string
+var delayRemoteTest float64
 
 var remoteCmCmd *exec.Cmd
 var ctx context.Context
@@ -129,6 +133,17 @@ func SetupImagePaths(resetLatestLink bool) error {
 
 			if err := os.Remove(latestLinkPath); err != nil {
 				return fmt.Errorf("error removing link: %s", err)
+			}
+		}
+
+		// remove old latest block file
+		if _, err := os.Stat(latestBlockPath); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("latest block file error: %s", err)
+			}
+		} else {
+			if err := os.Remove(latestBlockPath); err != nil {
+				return fmt.Errorf("error removing latest block file: %s", err)
 			}
 		}
 
@@ -274,12 +289,26 @@ func InitializeRemoteCartesi(
 		return err
 	}
 	remoteCmCmd = cmd
+	infolog.Println("running: ", command, strings.Join(args, " "))
 	err = remoteCmCmd.Start()
 	if err != nil {
 		warnlog.Println("remote cm: failed to initialize:", err)
 		ready <- err
 		return err
 	}
+	time.Sleep(time.Duration(delayRemoteTest * float64(time.Second)))
+	conn, err := net.DialTimeout("tcp", remoteCMAddress, remoteCmInitTimeout)
+	if err != nil {
+		warnlog.Println("remote cm: failed to connect remote cm:", err)
+		ready <- err
+		return err
+	}
+	if conn == nil {
+		warnlog.Println("remote cm: failed to initialize remote cm:", err)
+		ready <- err
+		return err
+	}
+	defer conn.Close()
 	ready <- nil
 	infolog.Println("remote cm: ready")
 	err = remoteCmCmd.Wait()
@@ -464,6 +493,28 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 		return fmt.Errorf("error converting payload to bin: %s", err)
 	}
 
+	if _, err := os.Stat(latestBlockPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("latest block file error: %s", err)
+		}
+	} else {
+		latestBlockBytes, err := os.ReadFile(latestBlockPath)
+		if err != nil {
+			return fmt.Errorf("latest block reding file error: %s", err)
+		}
+
+		latestBlock, err := strconv.Atoi(string(latestBlockBytes))
+		if err != nil {
+			return fmt.Errorf("latest block converting value error: %s", err)
+		}
+
+		if latestBlock >= int(metadata.BlockNumber) {
+			warnlog.Println("skipping input from block",metadata.BlockNumber,"(latest",latestBlock,")")
+			return nil
+		}
+	
+	}
+
 	payloadMap["0"] = data
 
 	advancePayload, err := abi.Encode(payloadMap, bytesTyp)
@@ -621,7 +672,11 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 
 	if cmdErr != nil {
 		warnlog.Println("error advancing", cmdErr)
-		return err
+
+		if err := os.RemoveAll(newImagePath); err != nil {
+			return fmt.Errorf("error removing new image: %s", err)
+		}
+		return cmdErr
 	}
 
 	// copying flash drive
@@ -656,7 +711,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	}
 
 	// remove old link target
-	if fileInfo.Mode()&os.ModeSymlink != 0 {
+	if fileInfo.Mode() & os.ModeSymlink != 0 {
 		target, err := os.Readlink(fileInfo.Name())
 
 		if err != nil {
@@ -675,6 +730,21 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	err = os.Symlink(newImagePath, latestLinkPath)
 	if err != nil {
 		return fmt.Errorf("error creating latest link: %s", err)
+	}
+
+	// remove old latest block
+	if _, err := os.Stat(latestBlockPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("latest block file error: %s", err)
+		}
+	} else {
+		if err := os.Remove(latestBlockPath); err != nil {
+			return fmt.Errorf("error removing old latest block file: %s", err)
+		}
+	}
+    err = os.WriteFile(latestBlockPath, []byte(fmt.Sprintf("%d",metadata.BlockNumber)), os.ModePerm)
+	if err != nil {
+		return fmt.Errorf("error creating latest block file: %s", err)
 	}
 
 	err = remoteCmCmd.Cancel()
@@ -729,6 +799,8 @@ func main() {
 	flag.BoolVar(&disableInspect, "disable-inspect", false, "Disable inspect requests")
 	flag.BoolVar(&resetLatestLink, "reset-latest", false,
 		"Reset latest link (otherwise use latest link target as base image)")
+	flag.Float64Var(&delayRemoteTest, "remote-delay", 0.1, 
+		"Delay before testing remote cartesi machine")
 	flag.BoolVar(&help, "help", false, "Show this help")
 
 	flag.Parse()
@@ -748,7 +820,7 @@ func main() {
 	infolog.Println("setting up starting image")
 	err := SetupImagePaths(resetLatestLink)
 	if err != nil {
-		log.Panicln(fmt.Errorf("error setuping paths: %s", err))
+		log.Panicln(fmt.Errorf("error setting up paths: %s", err))
 	}
 
 	// Start cm services
