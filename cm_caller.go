@@ -97,7 +97,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 	startingImagePath := fmt.Sprintf("%s/%s_start", storePath, baseImagePath)
 
 	// set latest link image
-	_, errLink := os.Lstat(latestLinkPath)
+	_, errLink := os.Lstat(filepath.Join(storePath,latestLinkPath))
 	if errLink != nil {
 		fmt.Println("error", errLink)
 		if errors.Is(errLink, os.ErrNotExist) {
@@ -112,7 +112,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 		// remove old link
 		if errLink == nil {
 			// read link
-			fileInfo, err := os.Lstat(latestLinkPath)
+			fileInfo, err := os.Lstat(filepath.Join(storePath,latestLinkPath))
 			if err != nil {
 				return fmt.Errorf("error reading latest link: %s", err)
 			}
@@ -131,18 +131,18 @@ func SetupImagePaths(resetLatestLink bool) error {
 				}
 			}
 
-			if err := os.Remove(latestLinkPath); err != nil {
+			if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
 				return fmt.Errorf("error removing link: %s", err)
 			}
 		}
 
 		// remove old latest block file
-		if _, err := os.Stat(latestBlockPath); err != nil {
+		if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("latest block file error: %s", err)
 			}
 		} else {
-			if err := os.Remove(latestBlockPath); err != nil {
+			if err := os.Remove(filepath.Join(storePath,latestBlockPath)); err != nil {
 				return fmt.Errorf("error removing latest block file: %s", err)
 			}
 		}
@@ -204,14 +204,14 @@ func SetupImagePaths(resetLatestLink bool) error {
 			}
 		}
 
-		err = os.Symlink(startingImagePath, latestLinkPath)
+		err = os.Symlink(startingImagePath, filepath.Join(storePath,latestLinkPath))
 		if err != nil {
 			return fmt.Errorf("error creating latest link: %s", err)
 		}
 	}
 
 	// check image path
-	if _, err := os.Stat(latestLinkPath); err != nil {
+	if _, err := os.Stat(filepath.Join(storePath,latestLinkPath)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("image directory not found")
 		}
@@ -220,7 +220,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 
 	if flashdrivePath != "" {
 		// open config file
-		configFile, err := os.Open(filepath.Join(latestLinkPath, "config.json"))
+		configFile, err := os.Open(filepath.Join(storePath, latestLinkPath, "config.json"))
 		if err != nil {
 			return fmt.Errorf("read config error: %s", err)
 		}
@@ -245,7 +245,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 			strconv.FormatInt(int64(dataFlashdriveConfig.Length), 16))
 		if _, err := os.Stat(
 			filepath.Join(
-				latestLinkPath, flashdriveFile)); err != nil {
+				storePath, latestLinkPath, flashdriveFile)); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("drive error: %s", err)
 			}
@@ -326,7 +326,7 @@ func PreloadCM() error {
 	command := cmCommand
 
 	args := make([]string, 0)
-	args = append(args, fmt.Sprintf("--load=%s", latestLinkPath))
+	args = append(args, fmt.Sprintf("--load=%s", filepath.Join(storePath,latestLinkPath)))
 	args = append(args, fmt.Sprintf("--remote-address=%s", remoteCMAddress))
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-destroy")
@@ -493,12 +493,12 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 		return fmt.Errorf("error converting payload to bin: %s", err)
 	}
 
-	if _, err := os.Stat(latestBlockPath); err != nil {
+	if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("latest block file error: %s", err)
 		}
 	} else {
-		latestBlockBytes, err := os.ReadFile(latestBlockPath)
+		latestBlockBytes, err := os.ReadFile(filepath.Join(storePath,latestBlockPath))
 		if err != nil {
 			return fmt.Errorf("latest block reding file error: %s", err)
 		}
@@ -705,7 +705,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	}
 
 	// read link
-	fileInfo, err := os.Lstat(latestLinkPath)
+	fileInfo, err := os.Lstat(filepath.Join(storePath,latestLinkPath))
 	if err != nil {
 		return fmt.Errorf("error reading latest link: %s", err)
 	}
@@ -724,25 +724,25 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	}
 
 	// remove link and create link with new image
-	if err := os.Remove(latestLinkPath); err != nil {
+	if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
 		return fmt.Errorf("error removing link: %s", err)
 	}
-	err = os.Symlink(newImagePath, latestLinkPath)
+	err = os.Symlink(newImagePath, filepath.Join(storePath,latestLinkPath))
 	if err != nil {
 		return fmt.Errorf("error creating latest link: %s", err)
 	}
 
 	// remove old latest block
-	if _, err := os.Stat(latestBlockPath); err != nil {
+	if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("latest block file error: %s", err)
 		}
 	} else {
-		if err := os.Remove(latestBlockPath); err != nil {
+		if err := os.Remove(filepath.Join(storePath,latestBlockPath)); err != nil {
 			return fmt.Errorf("error removing old latest block file: %s", err)
 		}
 	}
-    err = os.WriteFile(latestBlockPath, []byte(fmt.Sprintf("%d",metadata.BlockNumber)), os.ModePerm)
+    err = os.WriteFile(filepath.Join(storePath,latestBlockPath), []byte(fmt.Sprintf("%d",metadata.BlockNumber)), os.ModePerm)
 	if err != nil {
 		return fmt.Errorf("error creating latest block file: %s", err)
 	}
