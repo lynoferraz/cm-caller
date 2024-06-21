@@ -49,7 +49,7 @@ var warnlog = log.New(os.Stderr, "[ warn ]  ", log.Lshortfile)
 var dirMode fs.FileMode = 0755
 var fileMode fs.FileMode = 0644
 var waitDelay time.Duration = 10*time.Second
-var remoteCmInitTimeout time.Duration = 20*time.Second
+var remoteCmInitDelayTimeout time.Duration = 1*time.Second
 
 var cmCommand string = "cartesi-machine"
 var remoteCmCommand string = "jsonrpc-remote-cartesi-machine"
@@ -71,6 +71,7 @@ var voucherTyp = abi.MustNewType("tuple(address,bytes)")
 
 var imagePath, flashdrivePath, storePath string
 var delayRemoteTest float64
+var remoteCmInitTimeout float64
 
 var remoteCmCmd *exec.Cmd
 var ctx context.Context
@@ -117,17 +118,23 @@ func SetupImagePaths(resetLatestLink bool) error {
 				return fmt.Errorf("error reading latest link: %s", err)
 			}
 
+			removeOldTarget := true
 			// remove old link target
 			if fileInfo.Mode()&os.ModeSymlink != 0 {
 				target, err := os.Readlink(fileInfo.Name())
 
-				if err != nil {
-					return fmt.Errorf("error getting latest link target: %s",
+				if err != nil { // no target
+					if errors.Is(err, os.ErrNotExist) {
+						removeOldTarget = false
+					} else {
+						return fmt.Errorf("error getting latest link target: %s",
 						err)
+					}
 				}
-
-				if err := os.RemoveAll(target); err != nil {
-					return fmt.Errorf("error removing old link target: %s", err)
+				if removeOldTarget {
+					if err := os.RemoveAll(target); err != nil {
+						return fmt.Errorf("error removing old link target: %s", err)
+					}
 				}
 			}
 
@@ -204,7 +211,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 			}
 		}
 
-		err = os.Symlink(startingImagePath, filepath.Join(storePath,latestLinkPath))
+		err = os.Symlink(strings.TrimPrefix(startingImagePath, fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
 		if err != nil {
 			return fmt.Errorf("error creating latest link: %s", err)
 		}
@@ -274,7 +281,7 @@ func InitializeRemoteCartesi(
 	cmd := exec.CommandContext(currCtx, command, args...)
 	cmd.Stdout = log
 	cmd.Stderr = log
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 	cmd.WaitDelay = time.Second * waitDelay
 	cmd.Cancel = func() error {
 		log.Close()
@@ -285,8 +292,8 @@ func InitializeRemoteCartesi(
 			warnlog.Println("remote cm: failed to send SIGTERM ",
 				"command", command, "error", err)
 		}
-
-		return err
+		
+		return nil
 	}
 	remoteCmCmd = cmd
 	infolog.Println("running: ", command, strings.Join(args, " "))
@@ -296,8 +303,15 @@ func InitializeRemoteCartesi(
 		ready <- err
 		return err
 	}
-	time.Sleep(time.Duration(delayRemoteTest * float64(time.Second)))
-	conn, err := net.DialTimeout("tcp", remoteCMAddress, remoteCmInitTimeout)
+	now := time.Now()
+	var conn net.Conn
+	for (time.Since(now) < time.Duration(remoteCmInitTimeout) * time.Second) {
+		time.Sleep(time.Duration(delayRemoteTest * float64(time.Second)))
+		conn, err = net.DialTimeout("tcp", remoteCMAddress, remoteCmInitDelayTimeout)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		warnlog.Println("remote cm: failed to connect remote cm:", err)
 		ready <- err
@@ -347,7 +361,7 @@ func PreloadCM() error {
 	infolog.Println("running: ", command, strings.Join(args, " "))
 	cmd := exec.Command(command, args...)
 	out, err := cmd.CombinedOutput()
-	infolog.Printf("\n%s", string(out))
+	infolog.Printf("\n====\n%s====", string(out))
 	if err != nil {
 		return err
 	}
@@ -457,7 +471,7 @@ func HandleInspect(payloadHex string) error {
 	infolog.Println("running: ", command, strings.Join(args, " "))
 	cmd := exec.Command(command, args...)
 	out, err := cmd.CombinedOutput()
-	infolog.Printf("\n%s", string(out))
+	infolog.Printf("\n====\n%s====", string(out))
 	if err != nil {
 		return err
 	}
@@ -562,6 +576,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-create")
 	// args = append(args, "--no-remote-destroy")
+	args = append(args, "--remote-shutdown")
 	args = append(args, "--assert-rolling-template")
 	args = append(args, fmt.Sprintf(
 		"--rollup-advance-state=epoch_index:%d,input_index_begin:%d,input_index_end:%d",
@@ -572,7 +587,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	infolog.Println("running: ", command, strings.Join(args, " "))
 	cmd := exec.Command(command, args...)
 	out, cmdErr := cmd.CombinedOutput()
-	infolog.Printf("\n%s", string(out))
+	infolog.Printf("\n====\n%s====", string(out))
 
 	// Redirect reports
 	files, err := filepath.Glob(fmt.Sprintf(
@@ -712,7 +727,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 
 	// remove old link target
 	if fileInfo.Mode() & os.ModeSymlink != 0 {
-		target, err := os.Readlink(fileInfo.Name())
+		target, err := os.Readlink(filepath.Join(storePath,fileInfo.Name()))
 
 		if err != nil {
 			return fmt.Errorf("error getting latest link target: %s", err)
@@ -727,7 +742,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
 		return fmt.Errorf("error removing link: %s", err)
 	}
-	err = os.Symlink(newImagePath, filepath.Join(storePath,latestLinkPath))
+	err = os.Symlink(strings.TrimPrefix(newImagePath, fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
 	if err != nil {
 		return fmt.Errorf("error creating latest link: %s", err)
 	}
@@ -747,6 +762,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 		return fmt.Errorf("error creating latest block file: %s", err)
 	}
 
+
 	err = remoteCmCmd.Cancel()
 	if err != nil {
 		defer cancel()
@@ -754,7 +770,6 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	}
 
 	err = StartRemoteCartesiRoutine()
-
 	if err != nil {
 		return fmt.Errorf("remote cm error: %s", err)
 	}
@@ -800,7 +815,9 @@ func main() {
 	flag.BoolVar(&resetLatestLink, "reset-latest", false,
 		"Reset latest link (otherwise use latest link target as base image)")
 	flag.Float64Var(&delayRemoteTest, "remote-delay", 0.1, 
-		"Delay before testing remote cartesi machine")
+		"Delay between remote cartesi machine tests")
+	flag.Float64Var(&remoteCmInitTimeout, "remote-timeout", 10.0, 
+		"Timeout for testing the remote cartesi machine")
 	flag.BoolVar(&help, "help", false, "Show this help")
 
 	flag.Parse()
