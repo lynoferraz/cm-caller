@@ -733,7 +733,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 			return fmt.Errorf("error getting latest link target: %s", err)
 		}
 
-		if err := os.RemoveAll(target); err != nil {
+		if err := os.RemoveAll(filepath.Join(storePath,target)); err != nil {
 			return fmt.Errorf("error removing old link target: %s", err)
 		}
 	}
