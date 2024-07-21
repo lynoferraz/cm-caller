@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"sync"
 	"time"
 	"net"
 
@@ -54,11 +55,14 @@ var remoteCmInitDelayTimeout time.Duration = 1*time.Second
 var cmCommand string = "cartesi-machine"
 var remoteCmCommand string = "jsonrpc-remote-cartesi-machine"
 
-var remoteCMAddress string = "localhost:8090"
+var remoteCMPort uint64 = 10000 
+var remoteCMHost string = "localhost"
+// var remoteCMAddress string = "localhost:8090"
 var cmOutput string = "cartesi_machine.out"
 var latestLinkPath string = "latest"
 var baseImagePath string = "local_image"
 var latestBlockPath string = "latest_block"
+var workingSnapshotDir string = "working_image"
 
 var inputFile string = "epoch-%d-input-%d.bin"
 var inputMetadataFile string = "epoch-%d-input-metadata-%d.bin"
@@ -79,6 +83,7 @@ var cancel context.CancelFunc
 var errorWaitGroup *errgroup.Group
 
 var dataFlashdriveConfig FlashDriveConfig
+var disableConsistencyChecks bool
 
 func SetupImagePaths(resetLatestLink bool) error {
 
@@ -100,7 +105,6 @@ func SetupImagePaths(resetLatestLink bool) error {
 	// set latest link image
 	_, errLink := os.Lstat(filepath.Join(storePath,latestLinkPath))
 	if errLink != nil {
-		fmt.Println("error", errLink)
 		if errors.Is(errLink, os.ErrNotExist) {
 			resetLatestLink = true
 		} else {
@@ -260,6 +264,16 @@ func SetupImagePaths(resetLatestLink bool) error {
 
 	}
 
+	// remove working snapshot
+	_, err = os.Stat(filepath.Join(storePath,workingSnapshotDir))
+	if err == nil {
+		if err := os.RemoveAll(filepath.Join(storePath,workingSnapshotDir)); err != nil {
+			return fmt.Errorf("error removing working snapshot dir: %s", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("working snapshot error: %s", err)
+	}
+
 	return nil
 }
 
@@ -272,10 +286,12 @@ func InitializeRemoteCartesi(
 		return err
 	}
 
+
+	var wg sync.WaitGroup
 	command := remoteCmCommand
 
 	args := make([]string, 0)
-	args = append(args, fmt.Sprintf("--server-address=%s", remoteCMAddress))
+	args = append(args, fmt.Sprintf("--server-address=%s:%d", remoteCMHost,remoteCMPort))
 	// args = append(args, fmt.Sprintf("--log-level=%s", logLevel))
 
 	cmd := exec.CommandContext(currCtx, command, args...)
@@ -285,19 +301,54 @@ func InitializeRemoteCartesi(
 	cmd.WaitDelay = time.Second * waitDelay
 	cmd.Cancel = func() error {
 		log.Close()
-		// Send the terminate signal to the process group by passing the negative pid.
-		infolog.Println("remote cm: sent SIGTERM command", command)
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-		if err != nil {
-			warnlog.Println("remote cm: failed to send SIGTERM ",
-				"command", command, "error", err)
+		
+		if ctx.Err() == nil {
+
+			// Send the terminate signal to the process group by passing the negative pid.
+			infolog.Println("remote cm: sent SIGTERM command", command)
+			err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			if err != nil {
+				warnlog.Println("remote cm: failed to send SIGTERM ",
+					"command", command, "error", err)
+			}
+			// cancelCommand := cmCommand
+
+			// cancelArgs := make([]string, 0)
+			// cancelArgs = append(cancelArgs, fmt.Sprintf("--remote-address=%s", remoteCMHost))
+			// cancelArgs = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
+			// cancelArgs = append(cancelArgs, "--remote-protocol=jsonrpc")
+			// cancelArgs = append(cancelArgs, "--no-remote-create")
+			// cancelArgs = append(cancelArgs, "--remote-shutdown")
+			// cancelArgs = append(cancelArgs, "--skip-root-hash-check")
+			// infolog.Println("running: ", command, strings.Join(cancelArgs, " "))
+			// cancelCmd := exec.Command(cancelCommand, cancelArgs...)
+			// out, err := cancelCmd.CombinedOutput()
+			// infolog.Printf("\n====\n%s====", string(out))
+			// if err != nil {
+			// 	warnlog.Println("remote cm: failed to send remote shutdown ",
+			// 		"command", cancelCommand, "error", err)
+			// }
+
+			wg.Wait()
+
+			// infolog.Println("remote proc",cmd.ProcessState,cmd.Process.Pid)
+			// if cmd.ProcessState != nil {
+			// 	infolog.Println("remote exited",cmd.ProcessState.Exited())
+			// }
+
+			// for (cmd.ProcessState == nil || !cmd.ProcessState.Exited()) {
+			// 	infolog.Println("remote still up")
+			// 	time.Sleep(time.Duration(delayRemoteTest * float64(time.Second)))
+			// }
+			
 		}
 		
 		return nil
 	}
 	remoteCmCmd = cmd
 	infolog.Println("running: ", command, strings.Join(args, " "))
-	err = remoteCmCmd.Start()
+	wg.Add(1)
+	err = cmd.Start()
 	if err != nil {
 		warnlog.Println("remote cm: failed to initialize:", err)
 		ready <- err
@@ -307,7 +358,7 @@ func InitializeRemoteCartesi(
 	var conn net.Conn
 	for (time.Since(now) < time.Duration(remoteCmInitTimeout) * time.Second) {
 		time.Sleep(time.Duration(delayRemoteTest * float64(time.Second)))
-		conn, err = net.DialTimeout("tcp", remoteCMAddress, remoteCmInitDelayTimeout)
+		conn, err = net.DialTimeout("tcp", fmt.Sprintf("%s:%d",remoteCMHost,remoteCMPort), remoteCmInitDelayTimeout)
 		if err == nil {
 			break
 		}
@@ -322,29 +373,82 @@ func InitializeRemoteCartesi(
 		ready <- err
 		return err
 	}
-	defer conn.Close()
+	conn.Close()
 	ready <- nil
 	infolog.Println("remote cm: ready")
-	err = remoteCmCmd.Wait()
+	err = cmd.Wait()
 	// finishedProcess <- struct{}{}
 	if ctx.Err() != nil {
 		warnlog.Println("init context error")
 		return ctx.Err()
 	}
+	wg.Done()
+	infolog.Println("remote cm: done")
 	return err
 }
 
 func PreloadCM() error {
 	infolog.Println("preloading cm: intializing")
 
+	// Copy target to work dir
+	workdirPath := filepath.Join(storePath,workingSnapshotDir)
+
+	target, err := os.Readlink(filepath.Join(storePath,latestLinkPath))
+
+	if err != nil { // no target
+		return fmt.Errorf("error getting latest link target: %s",
+		err)
+	}
+	latestPath := filepath.Join(storePath,target)
+
+
+	err = filepath.Walk(latestPath,
+		func(path string, info os.FileInfo, err error) error {
+			var relPath string = strings.TrimPrefix(path, latestPath)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				err = os.Mkdir(workdirPath, info.Mode())
+				return err
+			} else {
+				source, err := os.Open(filepath.Join(latestPath, relPath))
+				if err != nil {
+					return err
+				}
+				defer source.Close()
+
+				destination, err := os.Create(
+					filepath.Join(workdirPath, relPath))
+				if err != nil {
+					return err
+				}
+				defer destination.Close()
+
+				err = destination.Chmod(info.Mode())
+				if err != nil {
+					return err
+				}
+
+				_, err = io.Copy(destination, source)
+				return err
+			}
+		})
+	if err != nil {
+		return fmt.Errorf("error copying workdir path: %s", err)
+	}
+
 	command := cmCommand
 
 	args := make([]string, 0)
-	args = append(args, fmt.Sprintf("--load=%s", filepath.Join(storePath,latestLinkPath)))
-	args = append(args, fmt.Sprintf("--remote-address=%s", remoteCMAddress))
+	args = append(args, fmt.Sprintf("--load=%s", workdirPath))
+	args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-destroy")
 	// args = append(args, "--max-mcycle=0")
+	if disableConsistencyChecks {
+		args = append(args, "--skip-root-hash-check")
+	}
 	args = append(args, "--assert-rolling-template")
 
 	if flashdrivePath != "" {
@@ -460,10 +564,13 @@ func HandleInspect(payloadHex string) error {
 	command := cmCommand
 
 	args := make([]string, 0)
-	args = append(args, fmt.Sprintf("--remote-address=%s", remoteCMAddress))
+	args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-create")
 	args = append(args, "--no-remote-destroy")
+	if disableConsistencyChecks {
+		args = append(args, "--skip-root-hash-check")
+	}
 	args = append(args, "--assert-rolling-template")
 	args = append(args, "--rollup-inspect-state")
 	// args = append(args, "--quiet")
@@ -572,11 +679,14 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	command := cmCommand
 
 	args := make([]string, 0)
-	args = append(args, fmt.Sprintf("--remote-address=%s", remoteCMAddress))
+	args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
 	args = append(args, "--remote-protocol=jsonrpc")
 	args = append(args, "--no-remote-create")
-	// args = append(args, "--no-remote-destroy")
-	args = append(args, "--remote-shutdown")
+	args = append(args, "--no-remote-destroy")
+	// args = append(args, "--remote-shutdown")
+	if disableConsistencyChecks {
+		args = append(args, "--skip-root-hash-check")
+	}
 	args = append(args, "--assert-rolling-template")
 	args = append(args, fmt.Sprintf(
 		"--rollup-advance-state=epoch_index:%d,input_index_begin:%d,input_index_end:%d",
@@ -685,90 +795,99 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 		}
 	}
 
-	if cmdErr != nil {
-		warnlog.Println("error advancing", cmdErr)
+	// copying flash drive
+	if cmdErr == nil {
+		if flashdrivePath != "" {
+
+			flashdriveFile := fmt.Sprintf("%016s-%s.bin",
+				strconv.FormatInt(int64(dataFlashdriveConfig.Start), 16),
+				strconv.FormatInt(int64(dataFlashdriveConfig.Length), 16))
+
+			source, err := os.Open(filepath.Join(newImagePath, flashdriveFile))
+			if err != nil {
+				return err
+			}
+			defer source.Close()
+
+			destination, err := os.Create(flashdrivePath)
+			if err != nil {
+				return err
+			}
+			defer destination.Close()
+			_, err = io.Copy(destination, source)
+			if err != nil {
+				return err
+			}
+		}
+
+		// read link
+		fileInfo, err := os.Lstat(filepath.Join(storePath,latestLinkPath))
+		if err != nil {
+			return fmt.Errorf("error reading latest link: %s", err)
+		}
+
+		// remove old link target
+		if fileInfo.Mode() & os.ModeSymlink != 0 {
+			target, err := os.Readlink(filepath.Join(storePath,fileInfo.Name()))
+
+			if err != nil {
+				return fmt.Errorf("error getting latest link target: %s", err)
+			}
+
+			if err := os.RemoveAll(filepath.Join(storePath,target)); err != nil {
+				return fmt.Errorf("error removing old link target: %s", err)
+			}
+		}
+
+		// remove link and create link with new image
+		if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
+			return fmt.Errorf("error removing link: %s", err)
+		}
+		err = os.Symlink(strings.TrimPrefix(newImagePath, fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
+		if err != nil {
+			return fmt.Errorf("error creating latest link: %s", err)
+		}
+
+		// remove old latest block
+		if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("latest block file error: %s", err)
+			}
+		} else {
+			if err := os.Remove(filepath.Join(storePath,latestBlockPath)); err != nil {
+				return fmt.Errorf("error removing old latest block file: %s", err)
+			}
+		}
+		err = os.WriteFile(filepath.Join(storePath,latestBlockPath), []byte(fmt.Sprintf("%d",metadata.BlockNumber)), os.ModePerm)
+		if err != nil {
+			return fmt.Errorf("error creating latest block file: %s", err)
+		}
+	} else {
+		warnlog.Println("error advancing cartesi machine", cmdErr)
 
 		if err := os.RemoveAll(newImagePath); err != nil {
 			return fmt.Errorf("error removing new image: %s", err)
 		}
-		return cmdErr
+		// return cmdErr
 	}
 
-	// copying flash drive
-	if flashdrivePath != "" {
-
-		flashdriveFile := fmt.Sprintf("%016s-%s.bin",
-			strconv.FormatInt(int64(dataFlashdriveConfig.Start), 16),
-			strconv.FormatInt(int64(dataFlashdriveConfig.Length), 16))
-		fmt.Println("flashdrive file", filepath.Join(
-			newImagePath, flashdriveFile))
-		source, err := os.Open(filepath.Join(newImagePath, flashdriveFile))
-		if err != nil {
-			return err
-		}
-		defer source.Close()
-
-		destination, err := os.Create(flashdrivePath)
-		if err != nil {
-			return err
-		}
-		defer destination.Close()
-		_, err = io.Copy(destination, source)
-		if err != nil {
-			return err
-		}
-	}
-
-	// read link
-	fileInfo, err := os.Lstat(filepath.Join(storePath,latestLinkPath))
-	if err != nil {
-		return fmt.Errorf("error reading latest link: %s", err)
-	}
-
-	// remove old link target
-	if fileInfo.Mode() & os.ModeSymlink != 0 {
-		target, err := os.Readlink(filepath.Join(storePath,fileInfo.Name()))
-
-		if err != nil {
-			return fmt.Errorf("error getting latest link target: %s", err)
-		}
-
-		if err := os.RemoveAll(filepath.Join(storePath,target)); err != nil {
-			return fmt.Errorf("error removing old link target: %s", err)
-		}
-	}
-
-	// remove link and create link with new image
-	if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
-		return fmt.Errorf("error removing link: %s", err)
-	}
-	err = os.Symlink(strings.TrimPrefix(newImagePath, fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
-	if err != nil {
-		return fmt.Errorf("error creating latest link: %s", err)
-	}
-
-	// remove old latest block
-	if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("latest block file error: %s", err)
-		}
-	} else {
-		if err := os.Remove(filepath.Join(storePath,latestBlockPath)); err != nil {
-			return fmt.Errorf("error removing old latest block file: %s", err)
-		}
-	}
-    err = os.WriteFile(filepath.Join(storePath,latestBlockPath), []byte(fmt.Sprintf("%d",metadata.BlockNumber)), os.ModePerm)
-	if err != nil {
-		return fmt.Errorf("error creating latest block file: %s", err)
-	}
-
-
+	infolog.Println("canceling remote")
 	err = remoteCmCmd.Cancel()
 	if err != nil {
 		defer cancel()
-		return fmt.Errorf("remote cm: failed to cancel: %s", err)
+		return fmt.Errorf("remote cm: failed to shutdown: %s", err)
 	}
 
+	// remove working snapshot
+	if _, err := os.Stat(filepath.Join(storePath,workingSnapshotDir)); err == nil {
+		if err := os.RemoveAll(filepath.Join(storePath,workingSnapshotDir)); err != nil {
+			return fmt.Errorf("error removing working snapshot dir: %s", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("image error: %s", err)
+	}
+	
+	remoteCMPort = 10000 + metadata.InputIndex
 	err = StartRemoteCartesiRoutine()
 	if err != nil {
 		return fmt.Errorf("remote cm error: %s", err)
@@ -780,6 +899,10 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 			return fmt.Errorf("preload cm error: %s", err)
 		})
 		return fmt.Errorf("preload cm error: %s", err)
+	}
+
+	if cmdErr != nil {
+		return cmdErr
 	}
 
 	infolog.Println("advance: finished")
@@ -818,6 +941,7 @@ func main() {
 		"Delay between remote cartesi machine tests")
 	flag.Float64Var(&remoteCmInitTimeout, "remote-timeout", 10.0, 
 		"Timeout for testing the remote cartesi machine")
+	flag.BoolVar(&disableConsistencyChecks, "disable-consistency-checks", false, "Disable assert rollups and root hash checks when starting cm")
 	flag.BoolVar(&help, "help", false, "Show this help")
 
 	flag.Parse()
