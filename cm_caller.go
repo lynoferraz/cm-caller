@@ -84,6 +84,7 @@ var errorWaitGroup *errgroup.Group
 
 var dataFlashdriveConfig FlashDriveConfig
 var disableConsistencyChecks bool
+var disableWorkdir bool
 
 func SetupImagePaths(resetLatestLink bool) error {
 
@@ -390,50 +391,54 @@ func InitializeRemoteCartesi(
 func PreloadCM() error {
 	infolog.Println("preloading cm: intializing")
 
-	// Copy target to work dir
-	workdirPath := filepath.Join(storePath,workingSnapshotDir)
-
 	target, err := os.Readlink(filepath.Join(storePath,latestLinkPath))
+	var workdirPath string
+	if !disableWorkdir {
+		// Copy target to work dir
+		workdirPath = filepath.Join(storePath,workingSnapshotDir)
 
-	if err != nil { // no target
-		return fmt.Errorf("error getting latest link target: %s",
-		err)
+		if err != nil { // no target
+			return fmt.Errorf("error getting latest link target: %s",
+			err)
+		}
+		latestPath := filepath.Join(storePath,target)
+
+
+		err = filepath.Walk(latestPath,
+			func(path string, info os.FileInfo, err error) error {
+				var relPath string = strings.TrimPrefix(path, latestPath)
+				if err != nil {
+					return err
+				}
+				if info.IsDir() {
+					err = os.Mkdir(workdirPath, info.Mode())
+					return err
+				} else {
+					source, err := os.Open(filepath.Join(latestPath, relPath))
+					if err != nil {
+						return err
+					}
+					defer source.Close()
+
+					destination, err := os.Create(
+						filepath.Join(workdirPath, relPath))
+					if err != nil {
+						return err
+					}
+					defer destination.Close()
+
+					err = destination.Chmod(info.Mode())
+					if err != nil {
+						return err
+					}
+
+					_, err = io.Copy(destination, source)
+					return err
+				}
+			})
+	} else {
+		workdirPath = filepath.Join(storePath,target)
 	}
-	latestPath := filepath.Join(storePath,target)
-
-
-	err = filepath.Walk(latestPath,
-		func(path string, info os.FileInfo, err error) error {
-			var relPath string = strings.TrimPrefix(path, latestPath)
-			if err != nil {
-				return err
-			}
-			if info.IsDir() {
-				err = os.Mkdir(workdirPath, info.Mode())
-				return err
-			} else {
-				source, err := os.Open(filepath.Join(latestPath, relPath))
-				if err != nil {
-					return err
-				}
-				defer source.Close()
-
-				destination, err := os.Create(
-					filepath.Join(workdirPath, relPath))
-				if err != nil {
-					return err
-				}
-				defer destination.Close()
-
-				err = destination.Chmod(info.Mode())
-				if err != nil {
-					return err
-				}
-
-				_, err = io.Copy(destination, source)
-				return err
-			}
-		})
 	if err != nil {
 		return fmt.Errorf("error copying workdir path: %s", err)
 	}
@@ -448,6 +453,7 @@ func PreloadCM() error {
 	// args = append(args, "--max-mcycle=0")
 	if disableConsistencyChecks {
 		args = append(args, "--skip-root-hash-check")
+		args = append(args, "--skip-root-hash-store")
 	}
 	args = append(args, "--assert-rolling-template")
 
@@ -570,6 +576,7 @@ func HandleInspect(payloadHex string) error {
 	args = append(args, "--no-remote-destroy")
 	if disableConsistencyChecks {
 		args = append(args, "--skip-root-hash-check")
+		args = append(args, "--skip-root-hash-store")
 	}
 	args = append(args, "--assert-rolling-template")
 	args = append(args, "--rollup-inspect-state")
@@ -686,6 +693,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	// args = append(args, "--remote-shutdown")
 	if disableConsistencyChecks {
 		args = append(args, "--skip-root-hash-check")
+		args = append(args, "--skip-root-hash-store")
 	}
 	args = append(args, "--assert-rolling-template")
 	args = append(args, fmt.Sprintf(
@@ -879,12 +887,14 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	}
 
 	// remove working snapshot
-	if _, err := os.Stat(filepath.Join(storePath,workingSnapshotDir)); err == nil {
-		if err := os.RemoveAll(filepath.Join(storePath,workingSnapshotDir)); err != nil {
-			return fmt.Errorf("error removing working snapshot dir: %s", err)
+	if !disableWorkdir {
+		if _, err := os.Stat(filepath.Join(storePath,workingSnapshotDir)); err == nil {
+			if err := os.RemoveAll(filepath.Join(storePath,workingSnapshotDir)); err != nil {
+				return fmt.Errorf("error removing working snapshot dir: %s", err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("image error: %s", err)
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("image error: %s", err)
 	}
 	
 	remoteCMPort = 10000 + metadata.InputIndex
@@ -942,6 +952,7 @@ func main() {
 	flag.Float64Var(&remoteCmInitTimeout, "remote-timeout", 10.0, 
 		"Timeout for testing the remote cartesi machine")
 	flag.BoolVar(&disableConsistencyChecks, "disable-consistency-checks", false, "Disable assert rollups and root hash checks when starting cm")
+	flag.BoolVar(&disableWorkdir, "disable-workdir", false, "Disable copying snapshot to a workdir before starting cm")
 	flag.BoolVar(&help, "help", false, "Show this help")
 
 	flag.Parse()
