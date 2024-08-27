@@ -63,6 +63,9 @@ var latestLinkPath string = "latest"
 var baseImagePath string = "local_image"
 var latestBlockPath string = "latest_block"
 var workingSnapshotDir string = "working_image"
+var lastSnapshotTs uint64 = 0
+var lastAdvanceWithSnapshot uint64 = 0
+var noSnapshotsYet uint64 = 1
 
 var inputFile string = "epoch-%d-input-%d.bin"
 var inputMetadataFile string = "epoch-%d-input-metadata-%d.bin"
@@ -73,11 +76,11 @@ var metadataTyp = abi.MustNewType("tuple(address,uint256,uint256,uint256,uint256
 var bytesTyp = abi.MustNewType("tuple(bytes)")
 var voucherTyp = abi.MustNewType("tuple(address,bytes)")
 
-var imagePath, flashdrivePath, storePath string
+var imagePath, fromFlashdrivePath, storeFlashdrivePath, storePath string
 var delayRemoteTest float64
 var remoteCmInitTimeout float64
 
-var remoteCmCmd *exec.Cmd
+// var remoteCmCmd *exec.Cmd
 var ctx context.Context
 var cancel context.CancelFunc
 var errorWaitGroup *errgroup.Group
@@ -85,6 +88,10 @@ var errorWaitGroup *errgroup.Group
 var dataFlashdriveConfig FlashDriveConfig
 var disableConsistencyChecks bool
 var disableWorkdir bool
+var disableRemoteCm bool
+var saveSnapshotNAdvances uint64
+var saveSnapshotTimeout uint64
+
 
 func SetupImagePaths(resetLatestLink bool) error {
 
@@ -230,7 +237,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 		return fmt.Errorf("image error: %s", err)
 	}
 
-	if flashdrivePath != "" {
+	if fromFlashdrivePath != "" || storeFlashdrivePath != "" {
 		// open config file
 		configFile, err := os.Open(filepath.Join(storePath, latestLinkPath, "config.json"))
 		if err != nil {
@@ -346,7 +353,7 @@ func InitializeRemoteCartesi(
 		
 		return nil
 	}
-	remoteCmCmd = cmd
+	// remoteCmCmd = cmd
 	infolog.Println("running: ", command, strings.Join(args, " "))
 	wg.Add(1)
 	err = cmd.Start()
@@ -388,8 +395,7 @@ func InitializeRemoteCartesi(
 	return err
 }
 
-func PreloadCM() error {
-	infolog.Println("preloading cm: intializing")
+func prepareSnapshot() (string,error) {
 
 	target, err := os.Readlink(filepath.Join(storePath,latestLinkPath))
 	var workdirPath string
@@ -398,7 +404,7 @@ func PreloadCM() error {
 		workdirPath = filepath.Join(storePath,workingSnapshotDir)
 
 		if err != nil { // no target
-			return fmt.Errorf("error getting latest link target: %s",
+			return "",fmt.Errorf("error getting latest link target: %s",
 			err)
 		}
 		latestPath := filepath.Join(storePath,target)
@@ -439,6 +445,13 @@ func PreloadCM() error {
 	} else {
 		workdirPath = filepath.Join(storePath,target)
 	}
+	return workdirPath,err
+}
+
+func PreloadCM() error {
+	infolog.Println("preloading cm: intializing")
+
+	workdirPath,err := prepareSnapshot()
 	if err != nil {
 		return fmt.Errorf("error copying workdir path: %s", err)
 	}
@@ -457,14 +470,14 @@ func PreloadCM() error {
 	}
 	args = append(args, "--assert-rolling-template")
 
-	if flashdrivePath != "" {
-		if _, err := os.Stat(flashdrivePath); err == nil {
+	if fromFlashdrivePath != "" {
+		if _, err := os.Stat(fromFlashdrivePath); err == nil {
 			args = append(args,
 				fmt.Sprintf(
 					"--replace-flash-drive=start:%d,length:%d,filename:%s",
 					dataFlashdriveConfig.Start,
 					dataFlashdriveConfig.Length,
-					flashdrivePath))
+					fromFlashdrivePath))
 		}
 	}
 
@@ -682,15 +695,28 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	newImagePath := fmt.Sprintf("%s/%s_%d_%d_%d",
 		storePath, baseImagePath, metadata.EpochIndex,
 		metadata.InputIndex, metadata.BlockNumber)
+	
+	storeCurrentAdvance := 
+		(saveSnapshotNAdvances > 0 && metadata.InputIndex >= lastAdvanceWithSnapshot + saveSnapshotNAdvances - noSnapshotsYet) || 
+		(saveSnapshotTimeout > 0 && metadata.Timestamp >= lastSnapshotTs + saveSnapshotTimeout)
 
 	command := cmCommand
 
 	args := make([]string, 0)
-	args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
-	args = append(args, "--remote-protocol=jsonrpc")
-	args = append(args, "--no-remote-create")
-	args = append(args, "--no-remote-destroy")
-	// args = append(args, "--remote-shutdown")
+	if !disableRemoteCm {
+		args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
+		args = append(args, "--remote-protocol=jsonrpc")
+		args = append(args, "--no-remote-create")
+		// args = append(args, "--no-remote-destroy")
+	} else {
+		workdirPath,err := prepareSnapshot()
+		if err != nil {
+			return fmt.Errorf("error copying workdir path: %s", err)
+		}
+		args = append(args, fmt.Sprintf("--load=%s", workdirPath))
+		args = append(args, "--no-rollback")
+	}
+
 	if disableConsistencyChecks {
 		args = append(args, "--skip-root-hash-check")
 		args = append(args, "--skip-root-hash-store")
@@ -699,7 +725,13 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	args = append(args, fmt.Sprintf(
 		"--rollup-advance-state=epoch_index:%d,input_index_begin:%d,input_index_end:%d",
 		metadata.EpochIndex, metadata.InputIndex, metadata.InputIndex+1))
-	args = append(args, fmt.Sprintf("--store=%s", newImagePath))
+
+	if storeCurrentAdvance {
+		args = append(args, fmt.Sprintf("--store=%s", newImagePath))
+		if !disableRemoteCm {
+			args = append(args, "--remote-shutdown")
+		}
+	}
 	// args = append(args, "--quiet")
 
 	infolog.Println("running: ", command, strings.Join(args, " "))
@@ -805,7 +837,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 
 	// copying flash drive
 	if cmdErr == nil {
-		if flashdrivePath != "" {
+		if storeFlashdrivePath != "" {
 
 			flashdriveFile := fmt.Sprintf("%016s-%s.bin",
 				strconv.FormatInt(int64(dataFlashdriveConfig.Start), 16),
@@ -817,7 +849,7 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 			}
 			defer source.Close()
 
-			destination, err := os.Create(flashdrivePath)
+			destination, err := os.Create(storeFlashdrivePath)
 			if err != nil {
 				return err
 			}
@@ -828,43 +860,49 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 			}
 		}
 
-		// read link
-		fileInfo, err := os.Lstat(filepath.Join(storePath,latestLinkPath))
-		if err != nil {
-			return fmt.Errorf("error reading latest link: %s", err)
-		}
-
-		// remove old link target
-		if fileInfo.Mode() & os.ModeSymlink != 0 {
-			target, err := os.Readlink(filepath.Join(storePath,fileInfo.Name()))
-
+		if storeCurrentAdvance {
+			// read link
+			fileInfo, err := os.Lstat(filepath.Join(storePath,latestLinkPath))
 			if err != nil {
-				return fmt.Errorf("error getting latest link target: %s", err)
+				return fmt.Errorf("error reading latest link: %s", err)
 			}
 
-			if err := os.RemoveAll(filepath.Join(storePath,target)); err != nil {
-				return fmt.Errorf("error removing old link target: %s", err)
-			}
-		}
+			// remove old link target
+			if fileInfo.Mode() & os.ModeSymlink != 0 {
+				target, err := os.Readlink(filepath.Join(storePath,fileInfo.Name()))
 
-		// remove link and create link with new image
-		if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
-			return fmt.Errorf("error removing link: %s", err)
-		}
-		err = os.Symlink(strings.TrimPrefix(newImagePath, fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
-		if err != nil {
-			return fmt.Errorf("error creating latest link: %s", err)
-		}
+				if err != nil {
+					return fmt.Errorf("error getting latest link target: %s", err)
+				}
 
-		// remove old latest block
-		if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("latest block file error: %s", err)
+				if err := os.RemoveAll(filepath.Join(storePath,target)); err != nil {
+					return fmt.Errorf("error removing old link target: %s", err)
+				}
 			}
-		} else {
-			if err := os.Remove(filepath.Join(storePath,latestBlockPath)); err != nil {
-				return fmt.Errorf("error removing old latest block file: %s", err)
+
+			// remove link and create link with new image
+			if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
+				return fmt.Errorf("error removing link: %s", err)
 			}
+			err = os.Symlink(strings.TrimPrefix(newImagePath, fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
+			if err != nil {
+				return fmt.Errorf("error creating latest link: %s", err)
+			}
+
+			// remove old latest block
+			if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("latest block file error: %s", err)
+				}
+			} else {
+				if err := os.Remove(filepath.Join(storePath,latestBlockPath)); err != nil {
+					return fmt.Errorf("error removing old latest block file: %s", err)
+				}
+			}
+
+			lastSnapshotTs = metadata.Timestamp
+			lastAdvanceWithSnapshot = metadata.InputIndex
+			noSnapshotsYet = 0
 		}
 		err = os.WriteFile(filepath.Join(storePath,latestBlockPath), []byte(fmt.Sprintf("%d",metadata.BlockNumber)), os.ModePerm)
 		if err != nil {
@@ -873,44 +911,49 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	} else {
 		warnlog.Println("error advancing cartesi machine", cmdErr)
 
-		if err := os.RemoveAll(newImagePath); err != nil {
-			return fmt.Errorf("error removing new image: %s", err)
-		}
-		// return cmdErr
-	}
-
-	infolog.Println("canceling remote")
-	err = remoteCmCmd.Cancel()
-	if err != nil {
-		defer cancel()
-		return fmt.Errorf("remote cm: failed to shutdown: %s", err)
-	}
-
-	// remove working snapshot
-	if !disableWorkdir {
-		if _, err := os.Stat(filepath.Join(storePath,workingSnapshotDir)); err == nil {
-			if err := os.RemoveAll(filepath.Join(storePath,workingSnapshotDir)); err != nil {
-				return fmt.Errorf("error removing working snapshot dir: %s", err)
+		if storeCurrentAdvance {
+			if err := os.RemoveAll(newImagePath); err != nil {
+				return fmt.Errorf("error removing new image: %s", err)
 			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("image error: %s", err)
+			// return cmdErr
 		}
 	}
-	
-	remoteCMPort = 10000 + metadata.InputIndex
-	err = StartRemoteCartesiRoutine()
-	if err != nil {
-		return fmt.Errorf("remote cm error: %s", err)
-	}
 
-	err = PreloadCM()
-	if err != nil {
-		errorWaitGroup.Go(func() error {
-			return fmt.Errorf("preload cm error: %s", err)
-		})
-		return fmt.Errorf("preload cm error: %s", err)
-	}
+	if storeCurrentAdvance {
+		if !disableWorkdir {
+			if _, err := os.Stat(filepath.Join(storePath,workingSnapshotDir)); err == nil {
+				if err := os.RemoveAll(filepath.Join(storePath,workingSnapshotDir)); err != nil {
+					return fmt.Errorf("error removing working snapshot dir: %s", err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("image error: %s", err)
+			}
+		}
 
+		if !disableRemoteCm {
+			// infolog.Println("canceling remote")
+			// err = remoteCmCmd.Cancel()
+			// if err != nil {
+			// 	defer cancel()
+			// 	return fmt.Errorf("remote cm: failed to shutdown: %s", err)
+			// }
+			
+			remoteCMPort = 10000 + metadata.InputIndex
+			err = StartRemoteCartesiRoutine()
+			if err != nil {
+				return fmt.Errorf("remote cm error: %s", err)
+			}
+
+			err = PreloadCM()
+			if err != nil {
+				errorWaitGroup.Go(func() error {
+					return fmt.Errorf("preload cm error: %s", err)
+				})
+				return fmt.Errorf("preload cm error: %s", err)
+			}
+
+		}
+	}
 	if cmdErr != nil {
 		return cmdErr
 	}
@@ -941,8 +984,10 @@ func main() {
 
 	flag.StringVar(&storePath, "store-path", ".", "Path where data and images are stored")
 	flag.StringVar(&imagePath, "image", "image", "Path to the cartesi machine image")
-	flag.StringVar(&flashdrivePath, "flash-data", "",
-		"Path to the flashdrive to save and insert in the cartesi machine when present")
+	flag.StringVar(&fromFlashdrivePath, "flash-data-read", "",
+		"Path to the flashdrive to insert in the cartesi machine when present")
+	flag.StringVar(&storeFlashdrivePath, "flash-data-store", "",
+		"Path to the flashdrive to save from the cartesi machine when present")
 	flag.BoolVar(&disableAdvance, "disable-advance", false, "Disable advance requests")
 	flag.BoolVar(&disableInspect, "disable-inspect", false, "Disable inspect requests")
 	flag.BoolVar(&resetLatestLink, "reset-latest", false,
@@ -951,8 +996,16 @@ func main() {
 		"Delay between remote cartesi machine tests")
 	flag.Float64Var(&remoteCmInitTimeout, "remote-timeout", 10.0, 
 		"Timeout for testing the remote cartesi machine")
-	flag.BoolVar(&disableConsistencyChecks, "disable-consistency-checks", false, "Disable assert rollups and root hash checks when starting cm")
-	flag.BoolVar(&disableWorkdir, "disable-workdir", false, "Disable copying snapshot to a workdir before starting cm")
+	flag.BoolVar(&disableConsistencyChecks, "disable-consistency-checks", false, 
+		"Disable assert rollups and root hash checks when starting cm")
+	flag.BoolVar(&disableWorkdir, "disable-workdir", false, 
+		"Disable copying snapshot to a workdir before starting cm (not recommeded with disable-remote)")
+	flag.BoolVar(&disableRemoteCm, "disable-remote", false, 
+		"Disable remote cm and do advances without no rollback option (not compatible with inspects)")
+	flag.Uint64Var(&saveSnapshotTimeout, "save-snapshot-timeout", 0, 
+		"Timeout to do a snapshot after an advance")
+	flag.Uint64Var(&saveSnapshotNAdvances, "save-snapshot-batch", 1, 
+		"Number of advances to batch before saving snapshots")
 	flag.BoolVar(&help, "help", false, "Show this help")
 
 	flag.Parse()
@@ -960,6 +1013,10 @@ func main() {
 	if help {
 		flag.PrintDefaults()
 		os.Exit(0)
+	}
+
+	if disableRemoteCm && !disableInspect {
+		log.Panicln(fmt.Errorf("Can't disable remote CM without disabling inspects"))
 	}
 
 	// Setup context
@@ -975,27 +1032,29 @@ func main() {
 		log.Panicln(fmt.Errorf("error setting up paths: %s", err))
 	}
 
-	// Start cm services
-	err = StartRemoteCartesiRoutine()
-	if err != nil {
-		if err := errorWaitGroup.Wait(); err != nil {
-			warnlog.Println("error in errgroup:", err)
-			os.Exit(1)
+	// Start remote cm services
+	if !disableRemoteCm {
+		err = StartRemoteCartesiRoutine()
+		if err != nil {
+			if err := errorWaitGroup.Wait(); err != nil {
+				warnlog.Println("error in errgroup:", err)
+				os.Exit(1)
+			}
 		}
-	}
 
-	// preload cm
-	err = PreloadCM()
-	if err != nil {
-		errorWaitGroup.Go(func() error {
-			return fmt.Errorf("preload cm error: %s", err)
-		})
-		if err := errorWaitGroup.Wait(); err != nil {
-			warnlog.Println("error in errgroup:", err)
-			os.Exit(1)
+		// preload cm
+		err = PreloadCM()
+		if err != nil {
+			errorWaitGroup.Go(func() error {
+				return fmt.Errorf("preload cm error: %s", err)
+			})
+			if err := errorWaitGroup.Wait(); err != nil {
+				warnlog.Println("error in errgroup:", err)
+				os.Exit(1)
+			}
+			infolog.Println("exiting")
+			os.Exit(0)
 		}
-		infolog.Println("exiting")
-		os.Exit(0)
 	}
 
 	// Add handlers and start rollup service
