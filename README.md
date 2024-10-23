@@ -27,21 +27,15 @@ First, you should start off from a base rootfs, either the one installed with ca
 cp /path/to/rootfs.ext2 rootfs.ext2
 ```
 
-### Start from a rootfs.ext2 and prepare image
-
-Before you install you app in the image, you should prepare and install any dependencies. Start the cartesi machine in interactive mode with network and volumes virtio:
-
-```shell
-cp /path/to/rootfs.ext2 rootfs.ext2
-```
-
 This rootfs.ext2` is your working image. Then, you should resize as you see necessary
 
 ```shell
 resize2fs -f rootfs.ext2 128M
 ```
 
-Start the cartesi machine in interactive mode with network and volumes virtio:
+### Start from a rootfs.ext2 and prepare image
+
+Before you install you app in the image, you should prepare and install any dependencies. Start the cartesi machine in interactive mode with network and volumes virtio:
 
 ```shell
 cartesi-machine --network --volume=.:/mnt --workdir=/mnt --flash-drive=label:root,filename:rootfs.ext2,shared -u=root -it -- bash
