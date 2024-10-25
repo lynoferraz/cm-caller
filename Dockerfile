@@ -39,8 +39,7 @@ RUN wget -qO- https://github.com/just-containers/s6-overlay/releases/download/v$
     tar xJf - -C / 
 # RUN rm -rf /etc/s6-overlay/s6-rc.d/*
 
-RUN mkdir -p /data
-RUN mkdir -p /data-inspect
+RUN useradd --user-group app
 
 # Configure traefik
 RUN <<EOF
@@ -49,8 +48,14 @@ echo '
 entryPoints:
   web:
     address: ":80"
+    asDefault: true
   anvil:
     address: ":8545"
+providers:
+  file:
+    filename: /etc/traefik/dynamic_conf.yaml
+' > /etc/traefik/traefik.yaml
+echo '
 http:
   routers:
     inspect-router:
@@ -60,6 +65,7 @@ http:
       rule: "PathPrefix(`/graphql`)"
       service: advance-service
     anvil-router:
+      rule: "PathPrefix(`/`)"
       entryPoints:
         - "anvil"
       service: anvil-service
@@ -76,21 +82,58 @@ http:
       loadBalancer:
         servers:
           - url: "http://localhost:8546/"
-' > /etc/traefik/traefik.yaml
+' > /etc/traefik/dynamic_conf.yaml
 EOF
+
+RUN mkdir -p -m 777 /mnt/snapshots
+ARG IMAGE_SNAPSHOT_PATH=/mnt/snapshots/0
+ENV IMAGE_SNAPSHOT_PATH ${IMAGE_SNAPSHOT_PATH}
+ARG DATA_PATH=/mnt/node
+ENV DATA_PATH ${DATA_PATH}
 
 # Configure s6 services
 RUN <<EOF
-mkdir -p /etc/s6-overlay/s6-rc.d/advance
+mkdir -p /etc/s6-overlay/s6-rc.d/prepare-dirs
+echo "oneshot" > /etc/s6-overlay/s6-rc.d/prepare-dirs/type
+echo "
+mkdir -p \${DATA_PATH}/db
+mkdir -p \${DATA_PATH}/advance
+mkdir -p \${DATA_PATH}/inspect
+" > /etc/s6-overlay/s6-rc.d/prepare-dirs/up
+mkdir -p /etc/s6-overlay/s6-rc.d/advance/dependencies.d
+touch /etc/s6-overlay/s6-rc.d/advance/dependencies.d/prepare-dirs
 echo "longrun" > /etc/s6-overlay/s6-rc.d/advance/type
 echo "#!/bin/sh
-exec nonodo --http-rollups-port=5004 --http-port=8080 --anvil-port=8546 --disable-inspect -- cm-caller -image=/mnt/snapshots/0 -store-path=/data -disable-inspect -disable-consistency-checks -disable-remote
+nonodo_chain_args=
+if [ -z \"${FROM_BLOCK}\" ] && [ -z \"${RPC_URL}\" ] && [ -z \"${APP_ADDRESS}\" ]; then
+  nonodo_chain_args=\"--from-block=${FROM_BLOCK} --rpc-url=${RPC_URL} --contracts-application-address=${APP_ADDRESS}\"
+else
+  nonodo_chain_args='--anvil-port=8546'
+fi
+exec nonodo \
+  --http-rollups-port=5004 --http-port=8080 \
+  --sqlite-file=${DATA_PATH}/db/database.sqlite \
+  ${nonodo_chain_args} \
+  --disable-inspect -- \
+  cm-caller \
+    -image=\${IMAGE_SNAPSHOT_PATH} \
+    -store-path=${DATA_PATH}/advance \
+    -disable-inspect -disable-consistency-checks -disable-remote
 " > /etc/s6-overlay/s6-rc.d/advance/run
 mkdir -p /etc/s6-overlay/s6-rc.d/inspect/dependencies.d
 touch /etc/s6-overlay/s6-rc.d/inspect/dependencies.d/advance
+touch /etc/s6-overlay/s6-rc.d/inspect/dependencies.d/prepare-dirs
 echo "longrun" > /etc/s6-overlay/s6-rc.d/inspect/type
 echo "#!/bin/sh
-exec nonodo --http-rollups-port=5005 --http-port=8081 --disable-devnet --disable-advance -- cm-caller -image=/mnt/snapshots/0 -store-path=/data-inspect -enable-watcher -watcher-path=/data/latest -disable-advance -disable-consistency-checks -reset-latest -disable-remote
+exec nonodo \
+  --http-rollups-port=5005 \
+  --http-port=8081 \
+  --disable-devnet --disable-advance -- \
+  cm-caller \
+    -image=\${IMAGE_SNAPSHOT_PATH} \
+    -store-path=${DATA_PATH}/inspect \
+    -enable-watcher -watcher-path=${DATA_PATH}/advance/latest \
+    -disable-advance -disable-consistency-checks -disable-remote
 " > /etc/s6-overlay/s6-rc.d/inspect/run
 mkdir -p /etc/s6-overlay/s6-rc.d/traefik/dependencies.d
 touch /etc/s6-overlay/s6-rc.d/traefik/dependencies.d/advance \
@@ -105,11 +148,9 @@ touch /etc/s6-overlay/s6-rc.d/user/contents.d/advance \
     /etc/s6-overlay/s6-rc.d/user/contents.d/traefik
 EOF
 
+
 FROM node-base as node
 
-COPY image /mnt/snapshots/0
-
-# TODO: remove this after nonodo version update
-COPY nonodo /usr/local/bin/nonodo
+USER app
 
 CMD ["/init"]

@@ -6,6 +6,7 @@ require (
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/lynoferraz/abigo v0.0.2
 	github.com/prototyp3-dev/go-rollups v1.0.0-rc3
+	github.com/radovskyb/watcher v1.0.7
 	golang.org/x/sync v0.6.0
 )
 

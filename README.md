@@ -53,10 +53,61 @@ root@localhost:/mnt# cp app /opt/cartesi/app/.
 With the rootfs in place, you can start the cartesi machine in rollups mode and generate the starting snapshot
 
 ```shell
-cartesi-machine --env=ROLLUP_HTTP_SERVER_URL=http://127.0.0.1:5004 --workdir=/opt/cartesi/app --flash-drive=label:root,filename:rootfs.ext2 --store=image --assert-rolling-template -- rollup-init /opt/cartesi/app/app
+cartesi-machine --env=ROLLUP_HTTP_SERVER_URL=http://127.0.0.1:5004 --flash-drive=label:root,filename:rootfs.ext2 --store=image --assert-rolling-template -- rollup-init /opt/cartesi/app/app
 ```
 
 The starting snapshot was saved to `image` directory. This snapshot is used by cm caller to run you application
+
+### Start node
+
+First build the node image
+
+```shell
+mkdir node
+docker run --rm -p8080:80 -p8545:8545 -v $PWD/image:/mnt/snapshots/0 -v $PWD/node:/mnt/node cm-caller-node /init
+```
+
+Then you can go to your apps directory and start a node on the snapshot (considered as `image` here)
+
+```shell
+mkdir node-data
+docker run --rm -p8080:80 -p8545:8545 -v $PWD/image:/mnt/snapshots/0 -v $PWD/node-data:/mnt/node cm-caller-node /init
+```
+
+You can also connect to an external rpc and start the node
+
+
+
+
+### Build Image with the App
+
+You should first build the node image. Then you should start in interactive mode to copy the image to the container and save it as your image
+
+```shell
+docker run -it --name app-node -p8080:80 -p8545:8545 -v $PWD:/workspace -w /workspace cm-caller-node bash
+```
+
+Then you should copy the image to the `/mnt/snapshots/0` dir
+
+```shell
+cp -r image /mnt/snapshots/0
+```
+
+Finally commit the image
+
+```shell
+docker commit app-node app-node:devel
+docker rm app-node
+```
+
+You can now start your app's node with
+
+```shell
+mkdir node-data
+docker run --rm -p8080:80 -p8545:8545 -v $PWD/node-data:/mnt/node app-node /init
+```
+
+Note: this image is ready to deploy on some cloud services
 
 ## Usage
 

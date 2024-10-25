@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,22 +10,23 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
+	"math/big"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"sync"
+	"syscall"
 	"time"
-	"net"
-	"bytes"
-  	"math/big"
 
+	"github.com/radovskyb/watcher"
 	"golang.org/x/sync/errgroup"
-	"github.com/fsnotify/fsnotify"
 
 	abi "github.com/lynoferraz/abigo"
 	"github.com/prototyp3-dev/go-rollups/handler"
@@ -52,17 +54,16 @@ var warnlog = log.New(os.Stderr, "[ warn ]  ", log.Lshortfile)
 
 var dirMode fs.FileMode = 0755
 var fileMode fs.FileMode = 0644
-var waitDelay time.Duration = 10*time.Second
-var remoteCmInitDelayTimeout time.Duration = 1*time.Second
+var waitDelay time.Duration = 10 * time.Second
+var remoteCmInitDelayTimeout time.Duration = 1 * time.Second
 
 var cmCommand string = "cartesi-machine"
 var remoteCmCommand string = "jsonrpc-remote-cartesi-machine"
 
-var baseRemoteCMPort uint64 
+var baseRemoteCMPort uint64 = 10000
 var remoteCMPort uint64
 var remoteCMHost string = "127.0.0.1"
-// var remoteCMAddress string = "127.0.0.1:8090"
-var cmOutput string
+var cmOutput string = "cartesi_machine.out"
 var latestLinkPath string = "latest"
 var baseImagePath string = "local_image"
 var latestBlockPath string = "latest_block"
@@ -76,14 +77,10 @@ var inputFile string = "input-%d.bin"
 var queryFile string = "query.bin"
 
 // var queryResponseFile = "query-report-0.bin"
-var inputPayloadTyp = abi.MustNewType("tuple(uint64,address,address,uint64,uint64,bytes32,uint64,bytes)")
+var inputPayloadTyp = abi.MustNewType(
+	"tuple(uint64,address,address,uint64,uint64,bytes32,uint64,bytes)")
 var voucherTyp = abi.MustNewType("tuple(address,uint256,bytes)")
 var bytesTyp = abi.MustNewType("tuple(bytes)")
-
-var evmAdvanceHeader []byte = []byte{65, 91, 243, 99} // Notice header bytes 0x415bf363
-var noticeHeader []byte = []byte{194, 88, 214, 229} // Notice header bytes 0xc258d6e5
-var voucherHeader []byte = []byte{35, 122, 129, 111} // voucher header 0x237a816f
-var delegatedVoucherHeader []byte = []byte{16, 50, 30, 139} // delegated voucher header 0x10321e8b
 
 var imagePath, fromFlashdrivePath, storeFlashdrivePath, storePath, watcherPath string
 var delayRemoteTest float64
@@ -101,6 +98,17 @@ var disableRemoteCm bool
 var saveSnapshotNAdvances uint64
 var saveSnapshotTimeout uint64
 
+// Notice header bytes 0x415bf363
+var evmAdvanceHeader []byte = []byte{65, 91, 243, 99}
+
+// Notice header bytes 0xc258d6e5
+var noticeHeader []byte = []byte{194, 88, 214, 229}
+
+// voucher header 0x237a816f
+var voucherHeader []byte = []byte{35, 122, 129, 111}
+
+// delegated voucher header 0x10321e8b
+var delegatedVoucherHeader []byte = []byte{16, 50, 30, 139}
 
 func SetupImagePaths(resetLatestLink bool) error {
 
@@ -120,7 +128,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 	startingImagePath := fmt.Sprintf("%s/%s_start", storePath, baseImagePath)
 
 	// set latest link image
-	_, errLink := os.Lstat(filepath.Join(storePath,latestLinkPath))
+	_, errLink := os.Lstat(filepath.Join(storePath, latestLinkPath))
 	if errLink != nil {
 		if errors.Is(errLink, os.ErrNotExist) {
 			resetLatestLink = true
@@ -134,7 +142,7 @@ func SetupImagePaths(resetLatestLink bool) error {
 		// remove old link
 		if errLink == nil {
 			// read link
-			fileInfo, err := os.Lstat(filepath.Join(storePath,latestLinkPath))
+			fileInfo, err := os.Lstat(filepath.Join(storePath, latestLinkPath))
 			if err != nil {
 				return fmt.Errorf("error reading latest link: %s", err)
 			}
@@ -148,46 +156,47 @@ func SetupImagePaths(resetLatestLink bool) error {
 					if errors.Is(err, os.ErrNotExist) {
 						removeOldTarget = false
 					} else {
-						return fmt.Errorf("error getting latest link target: %s",
-						err)
+						return fmt.Errorf(
+							"error getting latest link target: %s", err)
 					}
 				}
 				if removeOldTarget {
 					if err := os.RemoveAll(target); err != nil {
-						return fmt.Errorf("error removing old link target: %s", err)
+						return fmt.Errorf(
+							"error removing old link target: %s", err)
 					}
 				}
 			}
 
-			if err := os.Remove(filepath.Join(storePath,latestLinkPath)); err != nil {
+			if err := os.Remove(filepath.Join(storePath, latestLinkPath)); err != nil {
 				return fmt.Errorf("error removing link: %s", err)
 			}
 		}
 
 		// remove old latest block file
-		if _, err := os.Stat(filepath.Join(storePath,latestBlockPath)); err != nil {
+		if _, err := os.Stat(filepath.Join(storePath, latestBlockPath)); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("latest block file error: %s", err)
 			}
 		} else {
-			if err := os.Remove(filepath.Join(storePath,latestBlockPath)); err != nil {
+			if err := os.Remove(filepath.Join(storePath, latestBlockPath)); err != nil {
 				return fmt.Errorf("error removing latest block file: %s", err)
 			}
 		}
 
 		// remove old latest index file
-		if _, err := os.Stat(filepath.Join(storePath,latestIndexPath)); err != nil {
+		if _, err := os.Stat(filepath.Join(storePath, latestIndexPath)); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("latest index file error: %s", err)
 			}
 		} else {
-			if err := os.Remove(filepath.Join(storePath,latestIndexPath)); err != nil {
+			if err := os.Remove(filepath.Join(storePath, latestIndexPath)); err != nil {
 				return fmt.Errorf("error removing latest index file: %s", err)
 			}
 		}
 
 		// copy image path to starting path
-		err := copyDir(imagePath,startingImagePath)
+		err := copyDir(imagePath, startingImagePath)
 		if err != nil {
 			return fmt.Errorf("error copying image path: %s", err)
 		}
@@ -203,14 +212,16 @@ func SetupImagePaths(resetLatestLink bool) error {
 			}
 		}
 
-		err = os.Symlink(strings.TrimPrefix(startingImagePath, fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
+		err = os.Symlink(strings.TrimPrefix(startingImagePath,
+			fmt.Sprintf("%s/", filepath.Join(storePath, ""))),
+			filepath.Join(storePath, latestLinkPath))
 		if err != nil {
 			return fmt.Errorf("error creating latest link: %s", err)
 		}
 	}
 
 	// check image path
-	if _, err := os.Stat(filepath.Join(storePath,latestLinkPath)); err != nil {
+	if _, err := os.Stat(filepath.Join(storePath, latestLinkPath)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("image directory not found")
 		}
@@ -253,9 +264,9 @@ func SetupImagePaths(resetLatestLink bool) error {
 	}
 
 	// remove working snapshot
-	_, err = os.Stat(filepath.Join(storePath,workingSnapshotDir))
+	_, err = os.Stat(filepath.Join(storePath, workingSnapshotDir))
 	if err == nil {
-		if err := os.RemoveAll(filepath.Join(storePath,workingSnapshotDir)); err != nil {
+		if err := os.RemoveAll(filepath.Join(storePath, workingSnapshotDir)); err != nil {
 			return fmt.Errorf("error removing working snapshot dir: %s", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -279,7 +290,7 @@ func InitializeRemoteCartesi(
 	command := remoteCmCommand
 
 	args := make([]string, 0)
-	args = append(args, fmt.Sprintf("--server-address=%s:%d", remoteCMHost,remoteCMPort))
+	args = append(args, fmt.Sprintf("--server-address=%s:%d", remoteCMHost, remoteCMPort))
 	// args = append(args, fmt.Sprintf("--log-level=%s", logLevel))
 
 	cmd := exec.CommandContext(currCtx, command, args...)
@@ -291,7 +302,8 @@ func InitializeRemoteCartesi(
 		log.Close()
 		
 		if ctx.Err() == nil {
-			// Send the terminate signal to the process group by passing the negative pid.
+			// Send the terminate signal to the process group 
+			//	 by passing the negative pid.
 			infolog.Println("remote cm: sent SIGTERM command", command)
 			err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 			if err != nil {
@@ -318,7 +330,8 @@ func InitializeRemoteCartesi(
 	var conn net.Conn
 	for (time.Since(now) < time.Duration(remoteCmInitTimeout) * time.Second) {
 		time.Sleep(time.Duration(delayRemoteTest * float64(time.Second)))
-		conn, err = net.DialTimeout("tcp", fmt.Sprintf("%s:%d",remoteCMHost,remoteCMPort), remoteCmInitDelayTimeout)
+		conn, err = net.DialTimeout("tcp", 
+			fmt.Sprintf("%s:%d", remoteCMHost, remoteCMPort), remoteCmInitDelayTimeout)
 		if err == nil {
 			break
 		}
@@ -349,21 +362,21 @@ func InitializeRemoteCartesi(
 
 func prepareSnapshot() (string,error) {
 
-	target, err := os.Readlink(filepath.Join(storePath,latestLinkPath))
+	target, err := os.Readlink(filepath.Join(storePath, latestLinkPath))
 	var workdirPath string
 	if !disableWorkdir {
 		// Copy target to work dir
-		workdirPath = filepath.Join(storePath,workingSnapshotDir)
+		workdirPath = filepath.Join(storePath, workingSnapshotDir)
 
 		if err != nil { // no target
 			return "",fmt.Errorf("error getting latest link target: %s",
 			err)
 		}
-		latestPath := filepath.Join(storePath,target)
+		latestPath := filepath.Join(storePath, target)
 
 		err = copyDir(latestPath, workdirPath)
 	} else {
-		workdirPath = filepath.Join(storePath,target)
+		workdirPath = filepath.Join(storePath, target)
 	}
 	return workdirPath,err
 }
@@ -395,7 +408,7 @@ func copyDir(pathFrom string, pathTo string) error {
 				if filepath.IsAbs(target) {
 					return copyDir(target, pathTo)
 				}
-				return copyDir(filepath.Join(filepath.Dir(path),target), pathTo)
+				return copyDir(filepath.Join(filepath.Dir(path), target), pathTo)
 			} else {
 				source, err := os.Open(filepath.Join(pathFrom, relPath))
 				if err != nil {
@@ -482,6 +495,9 @@ func HandleInspect(payloadHex string) error {
 	infolog.Println("inspect: received")
 	// encode query
 	data, err := rollups.Hex2Bin(payloadHex)
+	if err != nil {
+		return fmt.Errorf("error converting hex: %s", err)
+	}
 	
 	err = os.WriteFile(queryFile, data, os.ModePerm)
 	if err != nil {
@@ -493,7 +509,8 @@ func HandleInspect(payloadHex string) error {
 
 	args := make([]string, 0)
 	if !disableRemoteCm {
-		args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
+		args = append(args, fmt.Sprintf("--remote-address=%s:%d", 
+			remoteCMHost, remoteCMPort))
 		args = append(args, "--no-remote-create")
 		args = append(args, "--no-remote-destroy")
 	} else {
@@ -606,14 +623,17 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 		metadata.InputIndex, metadata.BlockNumber)
 	
 	storeCurrentAdvance := 
-		(saveSnapshotNAdvances > 0 && metadata.InputIndex >= lastAdvanceWithSnapshot + saveSnapshotNAdvances - noSnapshotsYet) || 
-		(saveSnapshotTimeout > 0 && metadata.BlockTimestamp >= lastSnapshotTs + saveSnapshotTimeout)
+		(saveSnapshotNAdvances > 0 && metadata.InputIndex >= 
+				lastAdvanceWithSnapshot + saveSnapshotNAdvances - noSnapshotsYet) ||
+		(saveSnapshotTimeout > 0 && metadata.BlockTimestamp >= 
+			lastSnapshotTs + saveSnapshotTimeout)
 
 	command := cmCommand
 
 	args := make([]string, 0)
 	if !disableRemoteCm {
-		args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
+		args = append(args, fmt.Sprintf("--remote-address=%s:%d", 
+			remoteCMHost, remoteCMPort))
 		args = append(args, "--no-remote-create")
 		// args = append(args, "--no-remote-destroy")
 	} else {
@@ -703,7 +723,8 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 				return fmt.Errorf("convert decoded to fields")
 			}
 
-			_, err = rollups.SendNotice(&rollups.Notice{Payload: rollups.Bin2Hex(dataBytes)})
+			_, err = rollups.SendNotice(&rollups.Notice{
+				Payload: rollups.Bin2Hex(dataBytes)})
 			if err != nil {
 				return fmt.Errorf("error making http request: %s", err)
 			}
@@ -790,7 +811,8 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 				target, err := os.Readlink(filepath.Join(storePath,fileInfo.Name()))
 
 				if err != nil {
-					return fmt.Errorf("error getting latest link target: %s", err)
+					return fmt.Errorf(
+						"error getting latest link target: %s", err)
 				}
 
 				if err := os.RemoveAll(filepath.Join(storePath,target)); err != nil {
@@ -804,7 +826,8 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 			}
 			err = os.Symlink(
 				strings.TrimPrefix(newImagePath, 
-					fmt.Sprintf("%s/",filepath.Join(storePath,""))), filepath.Join(storePath,latestLinkPath))
+					fmt.Sprintf("%s/",filepath.Join(storePath,""))), 
+					filepath.Join(storePath,latestLinkPath))
 			if err != nil {
 				return fmt.Errorf("error creating latest link: %s", err)
 			}
@@ -835,7 +858,10 @@ func HandleAdvance(metadata *rollups.Metadata, payloadHex string) error {
 	}
 
 	if storeCurrentAdvance {
-		StartRemoteCM(NewRemotePort())
+		err = StartRemoteCM(NewRemotePort())
+		if err != nil {
+			return fmt.Errorf("error starting remote cm: %s", err)
+		}
 	}
 	if cmdErr != nil {
 		return cmdErr
@@ -864,7 +890,7 @@ func StartRemoteCartesiRoutine() error {
 
 func NewRemotePort() uint64 {
 	newPort := remoteCMPort + 1
-	if newPort >= 65535 {
+	if newPort >= math.MaxUint16 {
 		return baseRemoteCMPort
 	}
 	return newPort
@@ -897,7 +923,8 @@ func RestartRemoteCM() error {
 		command := cmCommand
 
 		args := make([]string, 0)
-		args = append(args, fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
+		args = append(args, 
+			fmt.Sprintf("--remote-address=%s:%d", remoteCMHost, remoteCMPort))
 		args = append(args, "--no-remote-create")
 		if disableConsistencyChecks {
 			args = append(args, "--skip-root-hash-check")
@@ -930,7 +957,16 @@ func RestartRemoteCM() error {
 	return nil
 }
 
-func StartWatcher(w *fsnotify.Watcher) {
+func StartWatcher(w *watcher.Watcher, watcherInterval uint64, pathToWatch string) error {
+
+	parent := filepath.Dir(pathToWatch)
+	pattern := regexp.MustCompile(filepath.Base(pathToWatch))
+	if err := w.Add(parent); err != nil {
+		errMsg := fmt.Errorf("watcher add path: %s", err)
+		warnlog.Println(errMsg)
+		return errMsg
+	}
+	w.AddFilterHook(watcher.RegexFilterHook(pattern, false))
 
 	errorWaitGroup.Go(func() error {
 		for {
@@ -941,34 +977,57 @@ func StartWatcher(w *fsnotify.Watcher) {
 				warnlog.Println(errMsg)
 				return errMsg
 			// Read from Errors.
-			case err, ok := <-w.Errors:
-				if !ok {
-					warnlog.Println("watcher closed errors", err)
-					return nil
-				}
-				warnlog.Println("error in watcher", err)
+			case err := <-w.Error:
+				warnlog.Println("error in watcher loop", err)
+				return err
 			// Read from Events.
-			case e, ok := <-w.Events:
-				if !ok {
-					warnlog.Println("watcher closed evens")
-					return nil
-				}
-
-				if e.Name == imagePath && e.Op == fsnotify.Create {
+			case e := <-w.Event:
+				
+				if pattern.MatchString(e.FileInfo.Name()) && 
+					((e.FileInfo.IsDir() && e.Op == watcher.Create) || 
+					((e.FileInfo.Mode()&os.ModeSymlink) == os.ModeSymlink &&
+					e.Op == watcher.Write)) {
 					infolog.Printf("watcher: image changed")
 
 					err := RestartRemoteCM()
 					if err != nil {
-						return fmt.Errorf("restart remote cm error: %s", err)
+						return fmt.Errorf("restart remote cm error: %s",err)
 					}
 				}
+			case <-w.Closed:
+				infolog.Println("watcher closed")
+				return nil
 			}
 		}
 	})
+
+	errorWaitGroup.Go(func() error {
+		errCh := make(chan error)
+		infolog.Println("starting watcher")
+
+		go func() {
+			errCh <- w.Start(time.Millisecond * time.Duration(watcherInterval))
+		}()
+
+		select {
+			// Context done
+			case <-ctx.Done():
+				errMsg := fmt.Errorf("watcher starter context done: %s", ctx.Err())
+				warnlog.Println(errMsg)
+				return errMsg
+			case err := <- errCh:
+				if err != nil {
+					warnlog.Println("error in watcher",err)
+				}
+			return err
+		}
+	})
+	return nil
 }
 
 func main() {
 	var help, disableInspect, disableAdvance, resetLatestLink, enableWatcher bool
+	var watcherInterval uint64 = 1000
 
 	flag.StringVar(&storePath, "store-path", ".", "Path where data and images are stored")
 	flag.StringVar(&imagePath, "image", "image", "Path to the cartesi machine image")
@@ -987,18 +1046,25 @@ func main() {
 	flag.BoolVar(&disableConsistencyChecks, "disable-consistency-checks", false, 
 		"Disable root hash checks when starting cm and storing")
 	flag.BoolVar(&disableWorkdir, "disable-workdir", false, 
-		"Disable copying snapshot to a workdir before starting cm (not recommeded with disable-remote)")
+		"Disable copying snapshot to a workdir before starting cm " +
+		"(not recommended with disable-remote)")
 	flag.BoolVar(&disableRemoteCm, "disable-remote", false, 
-		"Disable remote cm and do advances without no rollback option (not compatible with inspects)")
+		"Disable remote cm and do advances without no rollback option " +
+		"(not compatible with inspects)")
 	flag.Uint64Var(&saveSnapshotTimeout, "save-snapshot-timeout", 0, 
 		"Timeout to do a snapshot after an advance")
 	flag.Uint64Var(&saveSnapshotNAdvances, "save-snapshot-batch", 1, 
 		"Number of advances to batch before saving snapshots")
 	flag.BoolVar(&enableWatcher, "enable-watcher", false, 
 		"Enables latest link watcher to reload remote cartesi machine")
-	flag.StringVar(&watcherPath, "watcher-path", "", "Path where for the watcher watch new images (deafault: image path)")
-	flag.Uint64Var(&baseRemoteCMPort, "base-remote-port", 10000, "Starting remote port")
-	flag.StringVar(&cmOutput, "remote-output", "cartesi_machine.out", "Path to the rmote cartesi machine output")
+	flag.StringVar(&watcherPath, "watcher-path", "", 
+		"Path where for the watcher watch new images (deafault: image path)")
+	flag.Uint64Var(&watcherInterval, "watcher-interval", watcherInterval, 
+		"Watcher polling interval")
+	flag.Uint64Var(&baseRemoteCMPort, "base-remote-port", baseRemoteCMPort, 
+		"Starting remote port")
+	flag.StringVar(&cmOutput, "remote-output", cmOutput, 
+		"Path to the rmote cartesi machine output")
 	flag.BoolVar(&help, "help", false, "Show this help")
 
 	flag.Parse()
@@ -1053,21 +1119,29 @@ func main() {
 	}
 
 	if enableWatcher {
-		w, err := fsnotify.NewWatcher()
-		if err != nil {
-			warnlog.Println("error creating a new watcher", err)
-			os.Exit(1)
-		}
+		w := watcher.New()
 		defer w.Close()
 
+		// w.SetMaxEvents(1)
+		w.FilterOps(watcher.Create,watcher.Write)
+		
 		pathToWatch := imagePath
 		if watcherPath != "" {
 			pathToWatch = watcherPath
 		}
 
-		w.Add(filepath.Dir(pathToWatch))
-
-		StartWatcher(w)
+		err = StartWatcher(w,watcherInterval,pathToWatch)
+		if err != nil {
+			errorWaitGroup.Go(func() error {
+				return fmt.Errorf("start watcher error: %s", err)
+			})
+			if err := errorWaitGroup.Wait(); err != nil {
+				warnlog.Println("error in errgroup:", err)
+				os.Exit(1)
+			}
+			infolog.Println("exiting")
+			os.Exit(0)
+		}
 	}
 
 	// Add handlers and start rollup service
