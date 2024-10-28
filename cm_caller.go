@@ -957,7 +957,8 @@ func RestartRemoteCM() error {
 	return nil
 }
 
-func StartWatcher(w *watcher.Watcher, watcherInterval uint64, pathToWatch string) error {
+func StartWatcher(w *watcher.Watcher, watcherInterval uint64, 
+		pathToWatch string, watcherDelay float64) error {
 
 	parent := filepath.Dir(pathToWatch)
 	pattern := regexp.MustCompile(filepath.Base(pathToWatch))
@@ -988,6 +989,8 @@ func StartWatcher(w *watcher.Watcher, watcherInterval uint64, pathToWatch string
 					((e.FileInfo.Mode()&os.ModeSymlink) == os.ModeSymlink &&
 					e.Op == watcher.Write)) {
 					infolog.Printf("watcher: image changed")
+					time.Sleep(time.Duration(watcherDelay * float64(time.Second)))
+					imagePath = e.Path
 
 					err := RestartRemoteCM()
 					if err != nil {
@@ -1028,6 +1031,7 @@ func StartWatcher(w *watcher.Watcher, watcherInterval uint64, pathToWatch string
 func main() {
 	var help, disableInspect, disableAdvance, resetLatestLink, enableWatcher bool
 	var watcherInterval uint64 = 1000
+	var watcherDelay float64 = 0.5
 
 	flag.StringVar(&storePath, "store-path", ".", "Path where data and images are stored")
 	flag.StringVar(&imagePath, "image", "image", "Path to the cartesi machine image")
@@ -1061,6 +1065,8 @@ func main() {
 		"Path where for the watcher watch new images (deafault: image path)")
 	flag.Uint64Var(&watcherInterval, "watcher-interval", watcherInterval, 
 		"Watcher polling interval")
+	flag.Float64Var(&watcherDelay, "watcher-delay", watcherDelay, 
+		"Delay to wait after path change")
 	flag.Uint64Var(&baseRemoteCMPort, "base-remote-port", baseRemoteCMPort, 
 		"Starting remote port")
 	flag.StringVar(&cmOutput, "remote-output", cmOutput, 
@@ -1130,7 +1136,7 @@ func main() {
 			pathToWatch = watcherPath
 		}
 
-		err = StartWatcher(w,watcherInterval,pathToWatch)
+		err = StartWatcher(w,watcherInterval,pathToWatch,watcherDelay)
 		if err != nil {
 			errorWaitGroup.Go(func() error {
 				return fmt.Errorf("start watcher error: %s", err)

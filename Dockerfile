@@ -1,7 +1,7 @@
 # syntax=docker.io/docker/dockerfile:1.4
 ARG CM_VERSION=0.19-preview2
 ARG NONODO_VERSION=2.10.1-beta
-ARG CM_CALLER_VERSION=0.2.0
+ARG CM_CALLER_VERSION=0.2.1
 ARG TRAEFIK_VERSION=3.1.6
 ARG S6_OVERLAY_VERSION=3.2.0.2
 
@@ -95,62 +95,64 @@ ENV DATA_PATH ${DATA_PATH}
 RUN <<EOF
 mkdir -p /etc/s6-overlay/s6-rc.d/prepare-dirs
 echo "oneshot" > /etc/s6-overlay/s6-rc.d/prepare-dirs/type
-echo "
+echo "#!/command/with-contenv sh
 mkdir -p \${DATA_PATH}/db
 mkdir -p \${DATA_PATH}/advance
 mkdir -p \${DATA_PATH}/inspect
-" > /etc/s6-overlay/s6-rc.d/prepare-dirs/up
+" > /etc/s6-overlay/s6-rc.d/prepare-dirs/run.sh
+chmod +x /etc/s6-overlay/s6-rc.d/prepare-dirs/run.sh
+echo "/etc/s6-overlay/s6-rc.d/prepare-dirs/run.sh" \
+> /etc/s6-overlay/s6-rc.d/prepare-dirs/up
 mkdir -p /etc/s6-overlay/s6-rc.d/advance/dependencies.d
 touch /etc/s6-overlay/s6-rc.d/advance/dependencies.d/prepare-dirs
 echo "longrun" > /etc/s6-overlay/s6-rc.d/advance/type
-echo "#!/bin/sh
-nonodo_chain_args=
-if [ -z \"${FROM_BLOCK}\" ] && [ -z \"${RPC_URL}\" ] && [ -z \"${APP_ADDRESS}\" ]; then
-  nonodo_chain_args=\"--from-block=${FROM_BLOCK} --rpc-url=${RPC_URL} --contracts-application-address=${APP_ADDRESS}\"
-else
-  nonodo_chain_args='--anvil-port=8546'
+echo "#!/command/with-contenv sh
+nonodo_chain_args='--anvil-port=8546'
+if [ ! -z \"\${FROM_BLOCK}\" ] && [ ! -z \"\${RPC_URL}\" ] && [ ! -z \"\${APP_ADDRESS}\" ]; then
+  nonodo_chain_args=\"--from-block=\${FROM_BLOCK} --rpc-url=\${RPC_URL} --contracts-application-address=\${APP_ADDRESS}\"
 fi
 exec nonodo \
   --http-rollups-port=5004 --http-port=8080 \
-  --sqlite-file=${DATA_PATH}/db/database.sqlite \
-  ${nonodo_chain_args} \
+  --sqlite-file=\${DATA_PATH}/db/database.sqlite \
+  \${nonodo_chain_args} \
   --disable-inspect -- \
   cm-caller \
     -image=\${IMAGE_SNAPSHOT_PATH} \
-    -store-path=${DATA_PATH}/advance \
+    -store-path=\${DATA_PATH}/advance \
     -disable-inspect -disable-consistency-checks -disable-remote
 " > /etc/s6-overlay/s6-rc.d/advance/run
 mkdir -p /etc/s6-overlay/s6-rc.d/inspect/dependencies.d
 touch /etc/s6-overlay/s6-rc.d/inspect/dependencies.d/advance
 touch /etc/s6-overlay/s6-rc.d/inspect/dependencies.d/prepare-dirs
 echo "longrun" > /etc/s6-overlay/s6-rc.d/inspect/type
-echo "#!/bin/sh
+echo "#!/command/with-contenv sh
 exec nonodo \
   --http-rollups-port=5005 \
   --http-port=8081 \
   --disable-devnet --disable-advance -- \
   cm-caller \
     -image=\${IMAGE_SNAPSHOT_PATH} \
-    -store-path=${DATA_PATH}/inspect \
-    -enable-watcher -watcher-path=${DATA_PATH}/advance/latest \
+    -store-path=\${DATA_PATH}/inspect \
+    -enable-watcher -watcher-path=\${DATA_PATH}/advance/local_image \
     -disable-advance -disable-consistency-checks -disable-remote
 " > /etc/s6-overlay/s6-rc.d/inspect/run
-mkdir -p /etc/s6-overlay/s6-rc.d/traefik/dependencies.d
-touch /etc/s6-overlay/s6-rc.d/traefik/dependencies.d/advance \
-    /etc/s6-overlay/s6-rc.d/traefik/dependencies.d/inspect
+mkdir -p /etc/s6-overlay/s6-rc.d/traefik
 echo "longrun" > /etc/s6-overlay/s6-rc.d/traefik/type
 echo "#!/bin/sh
 exec traefik
 " > /etc/s6-overlay/s6-rc.d/traefik/run
 mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d
-touch /etc/s6-overlay/s6-rc.d/user/contents.d/advance \
-    /etc/s6-overlay/s6-rc.d/user/contents.d/inspect \
-    /etc/s6-overlay/s6-rc.d/user/contents.d/traefik
+touch /etc/s6-overlay/s6-rc.d/user/contents.d/traefik \
+    /etc/s6-overlay/s6-rc.d/user/contents.d/prepare-dirs \
+    /etc/s6-overlay/s6-rc.d/user/contents.d/advance \
+    /etc/s6-overlay/s6-rc.d/user/contents.d/inspect
 EOF
 
 
 FROM node-base as node
 
 USER app
+
+COPY nonodo /usr/local/bin/nonodo
 
 CMD ["/init"]

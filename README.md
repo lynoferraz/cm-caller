@@ -63,21 +63,26 @@ The starting snapshot was saved to `image` directory. This snapshot is used by c
 First build the node image
 
 ```shell
-mkdir node
-docker run --rm -p8080:80 -p8545:8545 -v $PWD/image:/mnt/snapshots/0 -v $PWD/node:/mnt/node cm-caller-node /init
+docker build -t cm-caller-node .
 ```
 
 Then you can go to your apps directory and start a node on the snapshot (considered as `image` here)
 
 ```shell
-mkdir node-data
+mkdir -m 777 node-data
 docker run --rm -p8080:80 -p8545:8545 -v $PWD/image:/mnt/snapshots/0 -v $PWD/node-data:/mnt/node cm-caller-node /init
 ```
 
 You can also connect to an external rpc and start the node
 
-
-
+```shell
+docker run --rm -p8080:80 --add-host host.docker.internal=host-gateway \
+    -v $PWD/image:/mnt/snapshots/0 -v $PWD/node-data:/mnt/node \
+    -e RPC_URL=<rpc url> \
+    -e APP_ADDRESS=<application contract address> \
+    -e FROM_BLOCK=<application contract deploy block> \
+    cm-caller-node /init
+```
 
 ### Build Image with the App
 
