@@ -1,7 +1,7 @@
 # syntax=docker.io/docker/dockerfile:1.4
 ARG CM_VERSION=0.19-preview2
-ARG NONODO_VERSION=2.10.1-beta
-ARG CM_CALLER_VERSION=0.2.1
+ARG NONODO_VERSION=2.10.2-beta
+ARG CM_CALLER_VERSION=0.2.0-rc.1
 ARG TRAEFIK_VERSION=3.1.6
 ARG S6_OVERLAY_VERSION=3.2.0.2
 
@@ -109,7 +109,7 @@ echo "longrun" > /etc/s6-overlay/s6-rc.d/advance/type
 echo "#!/command/with-contenv sh
 nonodo_chain_args='--anvil-port=8546'
 if [ ! -z \"\${FROM_BLOCK}\" ] && [ ! -z \"\${RPC_URL}\" ] && [ ! -z \"\${APP_ADDRESS}\" ]; then
-  nonodo_chain_args=\"--from-block=\${FROM_BLOCK} --rpc-url=\${RPC_URL} --contracts-application-address=\${APP_ADDRESS}\"
+  nonodo_chain_args=\"--from-block=\${FROM_BLOCK} --contracts-input-box-block=\${FROM_BLOCK} --rpc-url=\${RPC_URL} --contracts-application-address=\${APP_ADDRESS}\"
 fi
 exec nonodo \
   --http-rollups-port=5004 --http-port=8080 \
@@ -152,7 +152,5 @@ EOF
 FROM node-base as node
 
 USER app
-
-COPY nonodo /usr/local/bin/nonodo
 
 CMD ["/init"]
